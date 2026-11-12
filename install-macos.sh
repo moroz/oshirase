@@ -35,7 +35,9 @@ else
 fi
 
 say "Building Oshirase.app"
-"$repo/macos/build-app.sh" "$repo/build" "$("$source_binary" version)" >/dev/null
+# On its own line so set -e stops here if the binary cannot run.
+version="$("$source_binary" version)"
+"$repo/macos/build-app.sh" "$repo/build" "$version" >/dev/null
 
 say "Installing $binary and $app"
 mkdir -p "$(dirname "$binary")" "$(dirname "$plist")" "$(dirname "$log")" "$(dirname "$app")"
@@ -45,14 +47,16 @@ ditto "$repo/build/Oshirase.app" "$app"
 
 # Launching through LaunchServices registers the bundle, and the first run
 # asks for permission here rather than when the first notification arrives.
+# open -W exits 0 whatever the app answers, so the answer is checked after,
+# by running the executable directly once the prompt is settled.
 say "Asking macOS for notification permission (answer the prompt if one appears)"
-answer="$(mktemp)"
-trap 'rm -f "$answer"' EXIT
-if ! open -W -n --stdout "$answer" --stderr "$answer" -a "$app" --args authorize; then
-  say "Could not launch $app"
+open -W -n -a "$app" --args authorize
+if ! answer="$("$app/Contents/MacOS/oshirase-notifier" authorize 2>&1)"; then
+  say "macOS will not show oshirase's notifications: $answer"
+  say "Fix that in System Settings → Notifications → oshirase, then run this again."
   exit 1
 fi
-say "$(cat "$answer")"
+say "$answer"
 
 sed -e "s|__BINARY__|$binary|" -e "s|__LOG__|$log|" \
   "$repo/launchd/$label.plist" > "$plist"

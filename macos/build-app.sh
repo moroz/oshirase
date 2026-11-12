@@ -25,7 +25,9 @@ identity="${identity:--}"
 rm -rf "$app"
 mkdir -p "$app/Contents/MacOS"
 
-# The bundle version must be numbers and dots: v0.1.0-3-gabc+dirty → 0.1.0.
+# The bundle version must be numbers and dots: v0.1.0+dirty → 0.1.0. Past a
+# tag Go stamps a pseudo-version for the next patch
+# (v0.1.1-0.20261112091225-9209d2bdb051 → 0.1.1), and "devel" becomes 0.
 bundle_version="$(printf '%s' "$version" | sed -E 's/^v//; s/[^0-9.].*$//')"
 sed -e "s|__VERSION__|${bundle_version:-0}|g" "$here/Info.plist" > "$app/Contents/Info.plist"
 
