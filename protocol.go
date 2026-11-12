@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"unicode/utf8"
 )
 
@@ -82,6 +83,11 @@ func (n *Notification) Normalize() error {
 	for _, field := range fields {
 		if !utf8.ValidString(field.value) {
 			return fmt.Errorf("%s is not valid UTF-8", field.name)
+		}
+		// A backend may pass the text as a process argument, which cannot
+		// hold a NUL; refuse it as the caller's mistake, not the platform's.
+		if strings.ContainsRune(field.value, 0) {
+			return fmt.Errorf("%s contains a NUL character", field.name)
 		}
 		length := utf8.RuneCountInString(field.value)
 		if length > field.limit {
