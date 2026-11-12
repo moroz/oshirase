@@ -23,7 +23,7 @@ const notifyTimeout = 10 * time.Second
 func runServe(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := flags.String("listen", envOr("OSHIRASE_LISTEN", defaultListen), "address to listen on")
-	backendName := flags.String("backend", "auto", "auto, log, or a platform backend (osascript)")
+	backendName := flags.String("backend", "auto", "auto, log, or a platform backend (macos)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}

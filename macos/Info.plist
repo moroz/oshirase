@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- The bundle macOS registers for notifications: its name is what System
+     Settings → Notifications lists, its identifier is what the permission is
+     stored against. build-app.sh fills in __VERSION__. -->
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>dev.moroz.oshirase.notifier</string>
+	<key>CFBundleName</key>
+	<string>oshirase</string>
+	<key>CFBundleDisplayName</key>
+	<string>oshirase</string>
+	<key>CFBundleExecutable</key>
+	<string>oshirase-notifier</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>__VERSION__</string>
+	<key>CFBundleVersion</key>
+	<string>__VERSION__</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>13.0</string>
+	<!-- No Dock icon or menu bar: it posts one notification and exits. -->
+	<key>LSUIElement</key>
+	<true/>
+</dict>
+</plist>
