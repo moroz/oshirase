@@ -12,7 +12,7 @@ oshirase send "Touch the YubiKey" "git push origin"   # in the guest
 ```
 
 The daemon keeps a stable HTTP protocol and hides how each platform shows a
-notification. Today that is macOS (Notification Center, through `osascript`).
+notification. Today that is macOS, through Oshirase.app (below).
 
 ## Install on macOS
 
@@ -25,8 +25,20 @@ That puts the binary at `~/.local/bin/oshirase`, loads the launchd agent
 `dev.moroz.oshirase` (started at login, restarted if it exits), and logs to
 `~/Library/Logs/oshirase.log`.
 
-macOS files `osascript` notifications under **Script Editor**: allow it in
-System Settings → Notifications if nothing appears.
+It also builds **Oshirase.app** (Xcode or its command-line tools needed) and
+installs it to `~/Applications`. The daemon shows every notification through
+it: a small signed app using Apple's UserNotifications framework, listed as
+**oshirase** in System Settings → Notifications. The installer launches it
+once so macOS asks for permission then, not when the first notification
+arrives.
+
+When notifications for oshirase are turned off, or its alert style is None,
+the app refuses and the daemon answers 502 with the reason, so the caller
+knows nothing was shown. Focus is the exception: macOS does not tell an app
+whether a Focus is holding its notifications back.
+
+The app is signed with `$OSHIRASE_SIGN_IDENTITY`, else the first "Apple
+Development" identity in the keychain, else ad hoc.
 
 ## Install in the guest
 
@@ -74,7 +86,7 @@ are ignored.
 
 | Status | Body |
 |---|---|
-| 200 | `{"delivered": true, "backend": "osascript"}` |
+| 200 | `{"delivered": true, "backend": "macos"}` |
 | 400, 413, 415 | `{"error": "..."}` — the request is wrong |
 | 403 | the request carried an `Origin` header |
 | 502 | `{"error": "..."}` — the platform refused to show it |
