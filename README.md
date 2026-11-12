@@ -28,6 +28,26 @@ That puts the binary at `~/.local/bin/oshirase`, loads the launchd agent
 macOS files `osascript` notifications under **Script Editor**: allow it in
 System Settings → Notifications if nothing appears.
 
+## Install in the guest
+
+```sh
+GOBIN=~/.local/bin go install .
+```
+
+`GOBIN` is set because mise points Go's own default at the directory of the
+current Go release, which goes away with the next upgrade.
+
+## Versions
+
+Releases are git tags, `vMAJOR.MINOR.PATCH`. Go stamps the version into the
+binary from the tag, so there is nothing to bump in the source:
+`oshirase version` prints `v0.1.0` for a build at that tag, a pseudo-version
+past it for later commits, and `+dirty` for uncommitted changes. The daemon
+reports the same string in `GET /v1/health`.
+
+The protocol has its own version, in the URL (`/v1`), and changes far less
+often than the binary.
+
 ## Reaching it from the guest
 
 The daemon listens on `127.0.0.1:4649` only, so nothing else on the network

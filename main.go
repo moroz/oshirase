@@ -9,10 +9,27 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 )
 
-// Set at build time with -ldflags "-X main.version=...".
-var version = "dev"
+// version is the module version Go stamps into the binary: the tag
+// (v0.1.0) for `go install ...@v0.1.0` or a build at a tagged commit, a
+// pseudo-version past the last tag otherwise, with +dirty for uncommitted
+// changes.
+var version = buildVersion()
+
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "unknown"
+	}
+	if info.Main.Version != "" && info.Main.Version != "(devel)" {
+		return info.Main.Version
+	}
+
+	// Built outside version control, or with -buildvcs=false.
+	return "devel"
+}
 
 const usage = `usage:
   oshirase serve [-listen addr] [-backend name]   run the daemon (host)

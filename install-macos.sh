@@ -24,9 +24,9 @@ if [[ $# -ge 1 ]]; then
   source_binary="$1"
 else
   say "Building"
-  stamp="$(git -C "$repo" describe --always --dirty 2>/dev/null || echo dev)"
+  # Go stamps the version from the git tag itself (see buildVersion).
   mkdir -p "$repo/build"
-  (cd "$repo" && go build -ldflags "-X main.version=$stamp" -o build/oshirase .)
+  (cd "$repo" && go build -o build/oshirase .)
   source_binary="$repo/build/oshirase"
 fi
 
