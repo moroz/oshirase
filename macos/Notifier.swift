@@ -27,7 +27,7 @@ struct Notifier {
                     title: arguments[1], body: arguments[2],
                     subtitle: arguments[3], urgency: arguments[4])
             case "authorize" where arguments.count == 1:
-                try await authorize()
+                try await authorize(prompt: true)
                 print("oshirase may show notifications")
             case nil:
                 // macOS launches the app with no arguments when someone clicks
@@ -45,7 +45,10 @@ struct Notifier {
     }
 
     static func post(title: String, body: String, subtitle: String, urgency: String) async throws {
-        try await authorize()
+        // Never prompt from here: the daemon kills this process after ten
+        // seconds, long before anyone answers a prompt, and the notification
+        // would be lost with nothing said about why.
+        try await authorize(prompt: false)
 
         let content = UNMutableNotificationContent()
         content.title = title
@@ -68,14 +71,17 @@ struct Notifier {
         try await UNUserNotificationCenter.current().add(request)
     }
 
-    // authorize asks for permission the first time (macOS shows its prompt)
-    // and afterwards checks that the person has not taken it back or turned
-    // the alerts off, which macOS would otherwise apply silently.
-    static func authorize() async throws {
+    // authorize checks that the person has not taken permission back or
+    // turned the alerts off, which macOS would otherwise apply silently. With
+    // prompt, it first asks for permission if nobody has been asked yet.
+    static func authorize(prompt: Bool) async throws {
         let center = UNUserNotificationCenter.current()
         var settings = await center.notificationSettings()
 
         if settings.authorizationStatus == .notDetermined {
+            guard prompt else {
+                throw Refusal("oshirase has not been allowed to show notifications yet; run install-macos.sh, or open -W -a ~/Applications/Oshirase.app --args authorize")
+            }
             let granted = try await center.requestAuthorization(options: [.alert, .sound])
             if !granted {
                 throw Refusal("notifications for oshirase were declined; allow them in System Settings → Notifications → oshirase")
