@@ -277,11 +277,21 @@ func storeGrant(ctx context.Context, path string, config *emailConfig, store str
 	switch store {
 	case secretsInKeyring:
 		config.Secrets, config.GrantID = secretsInKeyring, newGrantID()
+		item := keyringUser(config.GrantID)
 		if err := keyringStore.set(ctx, config.GrantID, config.secrets()); err != nil {
+			if errors.Is(err, errKeyringTimeout) || errors.Is(err, context.Canceled) {
+				// A write that timed out or was interrupted may still land.
+				fmt.Fprintf(report, "note: if the keyring item %s appears later, nothing uses it; delete it (see the README, \"Leftover keyring items\")\n", item)
+			}
 			return fmt.Errorf("storing the grant: %w", keyringFailure(err, config))
 		}
 		if _, err := saveEmailConfig(path, config); err != nil {
-			keyringStore.remove(ctx, config.GrantID)
+			// Undo the item, on a context of its own: ctx may be what ended.
+			undo, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if rmErr := keyringStore.remove(undo, config.GrantID); rmErr != nil {
+				fmt.Fprintf(report, "warning: could not delete the keyring item %s after failing to write %s: %v; nothing uses it, delete it by hand (see the README, \"Leftover keyring items\")\n", item, path, rmErr)
+			}
 			return err
 		}
 	case secretsInFile:
@@ -295,7 +305,7 @@ func storeGrant(ctx context.Context, path string, config *emailConfig, store str
 
 	if previous != "" && previous != config.GrantID {
 		if err := keyringStore.remove(ctx, previous); err != nil {
-			fmt.Fprintf(report, "warning: could not delete the previous grant's keyring item %s: %v\n", keyringUser(previous), err)
+			fmt.Fprintf(report, "warning: could not delete the previous grant's keyring item %s: %v; nothing uses it now, delete it by hand (see the README, \"Leftover keyring items\")\n", keyringUser(previous), err)
 		}
 	}
 	return nil

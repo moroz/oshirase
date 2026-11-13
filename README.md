@@ -197,6 +197,24 @@ keyring (no `"secrets"` field) is read the same way and keeps working; run
 `oshirase auth` again to move it into the keyring. `oshirase auth` deletes
 the previous grant's keyring item once the new one is saved.
 
+**Leftover keyring items.** Only the item named by `grant_id` in
+`email.json` is in use. A crash or an interrupted `oshirase auth` can leave
+others behind (auth and the daemon print the item's name when they know
+of one), each holding a live token. To find and delete them:
+
+```sh
+# Linux (secret-tool is in libsecret-tools / libsecret)
+secret-tool search --all service oshirase
+secret-tool clear service oshirase username email-grant-<grant id>
+
+# macOS: shows one item at a time; repeat until it finds none but the current one
+security find-generic-password -s oshirase
+security delete-generic-password -s oshirase -a email-grant-<grant id>
+```
+
+Revoking the grant with the provider as well (Google's account
+permissions page, Fastmail's settings) makes a leftover token worthless.
+
 Anything that can reach the daemon can make it send mail from your
 account, so it sends at most 10 emails in any minute and answers 502 to
 the rest ("not sent: 10 emails in the last minute is the limit"). Set

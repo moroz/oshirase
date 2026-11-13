@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/zalando/go-keyring"
 )
@@ -361,5 +362,27 @@ func TestStoreGrantKeyringFailure(t *testing.T) {
 	}
 	if after, _ := os.ReadFile(path); string(after) != string(before) {
 		t.Error("a failed keyring write changed email.json")
+	}
+}
+
+// failingDelete is a keyring whose deletes fail.
+type failingDelete struct{ *gatedKeyring }
+
+func (failingDelete) Delete(string, string) error { return errors.New("delete refused") }
+
+// When the file cannot be written and the new item cannot be removed
+// either, auth names the item left behind.
+func TestStoreGrantReportsALeftoverItem(t *testing.T) {
+	withKeyring(t, failingDelete{newGatedKeyring()}, time.Second)
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	os.WriteFile(blocker, nil, 0o600)
+	config := grantConfig()
+	var report strings.Builder
+	err := storeGrant(context.Background(), filepath.Join(blocker, "email.json"), config, secretsInKeyring, &report)
+	if err == nil {
+		t.Fatal("want the file write to fail")
+	}
+	if !strings.Contains(report.String(), keyringUser(config.GrantID)) || !strings.Contains(report.String(), "Leftover keyring items") {
+		t.Errorf("report = %q", report.String())
 	}
 }
