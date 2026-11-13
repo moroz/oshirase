@@ -144,7 +144,8 @@ Each grant is made once, interactively, **on the host** (the machine the
 daemon runs on): `oshirase auth` prints a URL, you open it in a browser on
 that machine, and the provider redirects back to a listener on
 `127.0.0.1:<random port>`. The authorization-code flow uses PKCE. The
-result goes to `email.json` in the user configuration directory:
+secrets go into the OS keyring (below) and everything else into
+`email.json` in the user configuration directory:
 
 | | |
 |---|---|
@@ -152,14 +153,49 @@ result goes to `email.json` in the user configuration directory:
 | macOS | `~/Library/Application Support/oshirase/email.json` |
 | anywhere | `$OSHIRASE_EMAIL_CONFIG`, or `-config` on `oshirase auth` |
 
-The file holds a long-lived credential, so it is written with mode 0600 in a
-0700 directory, and the daemon warns if it finds it readable by others. It
-is JSON (`provider`, `to`, `from`, `client_id`, `client_secret`,
-`token_endpoint`, `refresh_token` or `api_token`, `jmap_session`). The
-daemon reloads it when it changes, so re-running `oshirase auth` repairs a
-revoked grant without a restart. The daemon refuses to start with
-`-backend email` and no file. Neither it nor `oshirase auth` logs a token
-or a message body.
+`email.json` is JSON (`provider`, `to`, `from`, `client_id`,
+`token_endpoint`, `jmap_session`, `secrets`, `grant_id`), written with mode
+0600 in a 0700 directory. The daemon reloads it when it changes, so
+re-running `oshirase auth` repairs a revoked grant without a restart. The
+daemon refuses to start with `-backend email` and no file. Neither it nor
+`oshirase auth` logs a token or a message body.
+
+### Where the secrets are
+
+The refresh token (or Fastmail API token) and Google's client secret are
+kept in the OS keyring, one item per grant, under the service `oshirase`
+and the account `email-grant-<grant id>`; `email.json` says
+`"secrets": "keyring"` and names the grant, and holds no secret.
+
+| | |
+|---|---|
+| Linux | the Secret Service (e.g. GNOME Keyring), in the login collection, reached over D-Bus |
+| macOS | the login Keychain, through `/usr/bin/security` |
+
+What that buys over a 0600 file: the secrets are encrypted at rest, under
+your login password, so a copied disk, a backup or a stray `cat` of the
+configuration directory does not give them away, and they are locked
+while you are logged out. What it does not: while the keyring is unlocked,
+any other process running as you can ask for the item (on Linux, over
+D-Bus, without a prompt; on macOS, through the same `security` command
+oshirase uses). It keeps the secrets off the disk, not away from your own
+user.
+
+The daemon reads the item when it loads `email.json`, and writes a rotated
+Fastmail refresh token back to it. If the keyring is locked, absent (no
+Secret Service, e.g. on a server or before login) or the item is gone,
+the daemon still starts, logs why, and answers each notification with 502
+and the reason, e.g. `the Secret Service keyring is locked or unavailable:
+...; unlock it, or run oshirase auth google -store file`. A locked keyring
+may raise an unlock prompt on the desktop; the daemon waits 5 seconds for
+it, not longer, and does not ask again while that prompt is open.
+
+**Headless machines.** Where there is no keyring, `oshirase auth ...
+-store file` keeps the secrets in `email.json` itself (mode 0600,
+`"secrets": "file"`), as before. A configuration written before the
+keyring (no `"secrets"` field) is read the same way and keeps working; run
+`oshirase auth` again to move it into the keyring. `oshirase auth` deletes
+the previous grant's keyring item once the new one is saved.
 
 Anything that can reach the daemon can make it send mail from your
 account, so it sends at most 10 emails in any minute and answers 502 to
@@ -225,8 +261,9 @@ the sending identity (`-from`, else the account's first identity).
 
 Fastmail rotates the refresh token on every use and revokes the grant if an
 old one is used again. The daemon writes each new refresh token back to the
-file before it sends, so **do not copy `email.json` to a second machine**:
-the two would spend each other's tokens. Make one grant per machine.
+keyring item (or file) before it sends, so **do not copy a grant to a
+second machine**: the two would spend each other's tokens. Make one grant
+per machine.
 
 If OAuth does not suit, a Fastmail **API token** does the same job without
 it. Make one in Settings → Privacy & Security → API tokens with access to
