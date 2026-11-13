@@ -161,6 +161,11 @@ revoked grant without a restart. The daemon refuses to start with
 `-backend email` and no file. Neither it nor `oshirase auth` logs a token
 or a message body.
 
+Anything that can reach the daemon can make it send mail from your
+account, so it sends at most 10 emails in any minute and answers 502 to
+the rest ("not sent: 10 emails in the last minute is the limit"). Set
+`"max_per_minute"` in `email.json` to change that, or to `-1` for no limit.
+
 ### Gmail and Google Workspace
 
 Sending goes through the Gmail API (`users.messages.send`) with the scope

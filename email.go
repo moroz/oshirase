@@ -51,6 +51,22 @@ type emailConfig struct {
 
 	// JMAPSession is the JMAP session URL (Fastmail).
 	JMAPSession string `json:"jmap_session,omitempty"`
+
+	// MaxPerMinute caps how many emails the daemon sends in any minute: 0
+	// means the default, defaultMaxPerMinute, and -1 means no limit.
+	MaxPerMinute int `json:"max_per_minute,omitempty"`
+}
+
+// defaultMaxPerMinute keeps whatever can reach the daemon from sending
+// unlimited mail from the owner's account. A person wants a few
+// notifications a minute at most; a loop gone wrong wants hundreds.
+const defaultMaxPerMinute = 10
+
+func (c *emailConfig) perMinute() int {
+	if c.MaxPerMinute == 0 {
+		return defaultMaxPerMinute
+	}
+	return c.MaxPerMinute
 }
 
 func (c *emailConfig) validate() error {
@@ -71,6 +87,9 @@ func (c *emailConfig) validate() error {
 		}
 	default:
 		return fmt.Errorf("provider must be google or fastmail, not %q", c.Provider)
+	}
+	if c.MaxPerMinute < -1 {
+		return fmt.Errorf("max_per_minute must be a positive number, 0 for the default (%d) or -1 for no limit", defaultMaxPerMinute)
 	}
 	if _, err := mail.ParseAddress(c.To); err != nil {
 		return fmt.Errorf("to %q is not an email address: %w", c.To, err)
@@ -205,6 +224,7 @@ type emailBackend struct {
 	access  string
 	expiry  time.Time
 	jmap    *jmapAccount // what the JMAP session said, cached
+	recent  []time.Time  // when the sends of the last minute started
 }
 
 func (b *emailBackend) Name() string { return "email" }
@@ -216,6 +236,9 @@ func (b *emailBackend) Notify(ctx context.Context, n Notification) error {
 	if err := b.reloadIfChanged(); err != nil {
 		return err
 	}
+	if err := b.admit(); err != nil {
+		return err
+	}
 	message := composeEmail(n)
 	switch b.config.Provider {
 	case providerGoogle:
@@ -224,6 +247,30 @@ func (b *emailBackend) Notify(ctx context.Context, n Notification) error {
 		return b.sendJMAP(ctx, message)
 	}
 	return fmt.Errorf("unknown provider %q", b.config.Provider)
+}
+
+// admit enforces max_per_minute over a sliding minute. Every attempt
+// counts, failed ones too: each may have sent an email.
+func (b *emailBackend) admit() error {
+	limit := b.config.perMinute()
+	if limit < 0 {
+		return nil
+	}
+	now := b.clock()
+	kept := b.recent[:0]
+	for _, at := range b.recent {
+		if now.Sub(at) < time.Minute {
+			kept = append(kept, at)
+		}
+	}
+	b.recent = kept
+	if len(b.recent) >= limit {
+		wait := time.Minute - now.Sub(b.recent[0])
+		return fmt.Errorf("not sent: %d emails in the last minute is the limit (max_per_minute in %s); next one possible in %s",
+			limit, b.path, wait.Round(time.Second))
+	}
+	b.recent = append(b.recent, now)
+	return nil
 }
 
 // reloadIfChanged picks up a new grant from `oshirase auth` without

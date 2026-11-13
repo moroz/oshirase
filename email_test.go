@@ -562,6 +562,44 @@ func TestFastmailAPIToken(t *testing.T) {
 
 // --- Configuration
 
+func TestRateLimit(t *testing.T) {
+	backend, _, gmail := googleSetup(t)
+	now := time.Now()
+	backend.now = func() time.Time { return now }
+	n := Notification{Title: "x", Urgency: UrgencyNormal}
+	for i := range defaultMaxPerMinute {
+		if err := backend.Notify(context.Background(), n); err != nil {
+			t.Fatalf("send %d: %v", i, err)
+		}
+	}
+	err := backend.Notify(context.Background(), n)
+	if err == nil || !strings.Contains(err.Error(), "max_per_minute") {
+		t.Fatalf("err = %v", err)
+	}
+	if len(gmail.messages) != defaultMaxPerMinute {
+		t.Errorf("sent %d", len(gmail.messages))
+	}
+
+	now = now.Add(61 * time.Second)
+	if err := backend.Notify(context.Background(), n); err != nil {
+		t.Errorf("after a minute: %v", err)
+	}
+
+	// The limit is configurable, and -1 lifts it.
+	backend.config.MaxPerMinute = -1
+	for range 2 * defaultMaxPerMinute {
+		if err := backend.Notify(context.Background(), n); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend.config.MaxPerMinute = 1
+	backend.recent = nil
+	backend.Notify(context.Background(), n)
+	if backend.Notify(context.Background(), n) == nil {
+		t.Error("max_per_minute 1 allowed two")
+	}
+}
+
 func TestConfigReloadsAfterAuth(t *testing.T) {
 	backend, tokens, gmail := googleSetup(t)
 	tokens.failure = `{"error":"invalid_grant"}`
@@ -602,6 +640,7 @@ func TestConfigValidation(t *testing.T) {
 		"fastmail no from":    {Provider: providerFastmail, To: "a@example.com", APIToken: "x", JMAPSession: "s"},
 		"fastmail no grant":   {Provider: providerFastmail, To: "a@example.com", From: "b@example.com", JMAPSession: "s"},
 		"fastmail no session": {Provider: providerFastmail, To: "a@example.com", From: "b@example.com", APIToken: "x"},
+		"negative limit":      {Provider: providerFastmail, To: "a@example.com", From: "b@example.com", APIToken: "x", JMAPSession: "s", MaxPerMinute: -2},
 	}
 	for name, config := range cases {
 		if config.validate() == nil {
