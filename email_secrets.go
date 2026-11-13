@@ -93,6 +93,10 @@ type keyringClient struct {
 	pending bool
 }
 
+// late, passed to do, runs once a call its caller gave up on (timeout,
+// context) has finished after all; see emailBackend.lateWrite.
+type late func()
+
 // keyringStore is what the daemon and `oshirase auth` use. The timeout
 // bounds one call; a delivery can make several (a read when the
 // configuration is loaded, a write after a refresh), and each also ends with
@@ -102,8 +106,9 @@ type keyringClient struct {
 var keyringStore = &keyringClient{api: osKeyring{}, timeout: 5 * time.Second}
 
 // do runs call with the client's timeout, or until ctx ends, whichever is
-// first. Either way a call that has not returned stays pending.
-func (k *keyringClient) do(ctx context.Context, call func() error) error {
+// first. Either way a call that has not returned stays pending; when it
+// finishes, after its caller has gone, then (if not nil) runs.
+func (k *keyringClient) do(ctx context.Context, call func() error, then late) error {
 	k.mu.Lock()
 	if k.pending {
 		k.mu.Unlock()
@@ -113,23 +118,37 @@ func (k *keyringClient) do(ctx context.Context, call func() error) error {
 	k.mu.Unlock()
 
 	done := make(chan error, 1)
+	var abandoned bool // under k.mu
 	go func() {
 		err := call()
 		k.mu.Lock()
 		k.pending = false
+		gone := abandoned
 		k.mu.Unlock()
 		done <- err
+		if gone && then != nil {
+			then()
+		}
 	}()
 	timer := time.NewTimer(k.timeout)
 	defer timer.Stop()
+	var failure error
 	select {
 	case err := <-done:
 		return err
 	case <-timer.C:
-		return fmt.Errorf("%w within %s", errKeyringTimeout, k.timeout)
+		failure = fmt.Errorf("%w within %s", errKeyringTimeout, k.timeout)
 	case <-ctx.Done():
-		return fmt.Errorf("gave up waiting for the keyring: %w", ctx.Err())
+		failure = fmt.Errorf("gave up waiting for the keyring: %w", ctx.Err())
 	}
+	k.mu.Lock()
+	defer k.mu.Unlock()
+	if !k.pending {
+		// It finished as we gave up; the goroutine saw abandoned unset.
+		return <-done
+	}
+	abandoned = true
+	return failure
 }
 
 func (k *keyringClient) get(ctx context.Context, grantID string) (emailSecrets, error) {
@@ -137,7 +156,7 @@ func (k *keyringClient) get(ctx context.Context, grantID string) (emailSecrets, 
 	err := k.do(ctx, func() (err error) {
 		value, err = k.api.Get(keyringService, keyringUser(grantID))
 		return err
-	})
+	}, nil)
 	if err != nil {
 		return emailSecrets{}, err
 	}
@@ -150,20 +169,26 @@ func (k *keyringClient) get(ctx context.Context, grantID string) (emailSecrets, 
 }
 
 func (k *keyringClient) set(ctx context.Context, grantID string, secrets emailSecrets) error {
+	return k.write(ctx, grantID, secrets, nil)
+}
+
+// write is set, with then run if the write finishes after ctx or the
+// timeout gave up on it.
+func (k *keyringClient) write(ctx context.Context, grantID string, secrets emailSecrets, then late) error {
 	value, err := json.Marshal(secrets)
 	if err != nil {
 		return err
 	}
 	return k.do(ctx, func() error {
 		return k.api.Set(keyringService, keyringUser(grantID), string(value))
-	})
+	}, then)
 }
 
 // remove deletes a grant's item; one already gone is not an error.
 func (k *keyringClient) remove(ctx context.Context, grantID string) error {
 	err := k.do(ctx, func() error {
 		return k.api.Delete(keyringService, keyringUser(grantID))
-	})
+	}, nil)
 	if errors.Is(err, keyring.ErrNotFound) {
 		return nil
 	}

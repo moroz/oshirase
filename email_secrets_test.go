@@ -323,3 +323,157 @@ func TestSecretsShapeValidation(t *testing.T) {
 		t.Errorf("keyring mode without secrets: %v", err)
 	}
 }
+
+// gatedKeyring is an in-memory keyring whose writes can be held back, like
+// one waiting at an unlock prompt, and let through later.
+type gatedKeyring struct {
+	mu    sync.Mutex
+	items map[string]string
+	gate  chan struct{} // while not nil, Set waits for it to close
+}
+
+func newGatedKeyring() *gatedKeyring { return &gatedKeyring{items: map[string]string{}} }
+
+func (g *gatedKeyring) Get(_, user string) (string, error) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	value, ok := g.items[user]
+	if !ok {
+		return "", keyring.ErrNotFound
+	}
+	return value, nil
+}
+
+func (g *gatedKeyring) Set(_, user, value string) error {
+	g.mu.Lock()
+	gate := g.gate
+	g.mu.Unlock()
+	if gate != nil {
+		<-gate
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.items[user] = value
+	return nil
+}
+
+func (g *gatedKeyring) Delete(_, user string) error {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if _, ok := g.items[user]; !ok {
+		return keyring.ErrNotFound
+	}
+	delete(g.items, user)
+	return nil
+}
+
+func (g *gatedKeyring) hold() {
+	g.mu.Lock()
+	g.gate = make(chan struct{})
+	g.mu.Unlock()
+}
+
+func (g *gatedKeyring) release() {
+	g.mu.Lock()
+	gate := g.gate
+	g.gate = nil
+	g.mu.Unlock()
+	if gate != nil {
+		close(gate)
+	}
+}
+
+func (g *gatedKeyring) token(t *testing.T, grantID string) string {
+	t.Helper()
+	value, err := g.Get(keyringService, keyringUser(grantID))
+	if err != nil {
+		return ""
+	}
+	var secrets emailSecrets
+	json.Unmarshal([]byte(value), &secrets)
+	return secrets.RefreshToken
+}
+
+// The review's sequence: the write of rotated token T1 times out and stays
+// pending; the write of T2 is refused as busy; T1's write then lands late,
+// so the item holds the spent T1; and a touch of email.json reloads it.
+// The daemon must still refresh with T2, and the item must end up with the
+// newest token, not T1.
+func TestRotatedTokenSurvivesALateWriteAndAReload(t *testing.T) {
+	gated := newGatedKeyring()
+	defer gated.release()
+	withKeyring(t, gated, 50*time.Millisecond)
+	backend, tokens, jmap := keyringFastmailSetup(t)
+	clock := time.Now()
+	backend.now = func() time.Time { return clock }
+	notify := func(step string) {
+		t.Helper()
+		if err := backend.Notify(context.Background(), Notification{Title: step, Urgency: UrgencyNormal}); err != nil {
+			t.Fatalf("%s: %v", step, err)
+		}
+	}
+	t0 := secretRefresh
+	t1, t2 := t0+"-next", t0+"-next-next"
+
+	gated.hold()
+	notify("rotation 1, write of T1 times out")
+	if got := gated.token(t, "grant-a"); got != t0 {
+		t.Fatalf("item = %q before the late write", got)
+	}
+
+	clock = clock.Add(2 * time.Hour) // the access token expires
+	notify("rotation 2, write of T2 refused as busy")
+	if tokens.current != t2 {
+		t.Fatalf("endpoint expects %q, want T2", tokens.current)
+	}
+
+	// The held T1 write lands. The late-write hook then writes T2 over it;
+	// whether or not it has yet, a reload must not go back to T1.
+	gated.release()
+	now := time.Now().Add(time.Second)
+	os.Chtimes(backend.path, now, now) // a touch
+
+	clock = clock.Add(2 * time.Hour)
+	notify("after the reload") // refreshes with T2, or the endpoint refuses
+	if len(jmap.sent) != 3 {
+		t.Errorf("sent %d", len(jmap.sent))
+	}
+	t3 := tokens.current
+	deadline := time.Now().Add(2 * time.Second)
+	for gated.token(t, "grant-a") != t3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := gated.token(t, "grant-a"); got != t3 {
+		t.Errorf("item = %q, want the newest token %q (not T1 %q)", got, t3, t1)
+	}
+}
+
+// Without a later notification, the late write itself is followed by the
+// newest token, so a daemon restart reads that and not a spent one.
+func TestLateWriteIsFollowedByTheNewest(t *testing.T) {
+	gated := newGatedKeyring()
+	defer gated.release()
+	withKeyring(t, gated, 50*time.Millisecond)
+	backend, tokens, _ := keyringFastmailSetup(t)
+	clock := time.Now()
+	backend.now = func() time.Time { return clock }
+
+	gated.hold()
+	backend.Notify(context.Background(), Notification{Title: "1", Urgency: UrgencyNormal})
+	clock = clock.Add(2 * time.Hour)
+	backend.Notify(context.Background(), Notification{Title: "2", Urgency: UrgencyNormal})
+	gated.release()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for gated.token(t, "grant-a") != tokens.current && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := gated.token(t, "grant-a"); got != tokens.current {
+		t.Errorf("item = %q, want %q", got, tokens.current)
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if backend.unsaved != nil {
+		t.Errorf("unsaved still holds %q after it was written", backend.unsaved.token)
+	}
+}

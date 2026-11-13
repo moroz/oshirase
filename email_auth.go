@@ -351,7 +351,7 @@ func readAPIToken(input io.Reader) (string, error) {
 // lands in config and nowhere else: the file at path is the previous
 // grant's until the caller saves the complete configuration.
 func resolveFastmailIdentity(ctx context.Context, path string, config *emailConfig, access *tokenResponse, httpc *http.Client) error {
-	probe := &emailBackend{path: path, http: httpc, config: config, ephemeral: true}
+	probe := &emailBackend{path: path, http: httpc, config: config, ephemeral: true, keys: keyringStore}
 	if access != nil {
 		lifetime := time.Duration(access.ExpiresIn) * time.Second
 		if lifetime <= 0 {
