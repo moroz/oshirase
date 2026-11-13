@@ -18,6 +18,8 @@ import (
 	"net"
 	"net/mail"
 	"net/textproto"
+	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
@@ -559,4 +561,182 @@ func TestSMTPRefusalQuotingThePasswordIsRedacted(t *testing.T) {
 		t.Errorf("err = %v", err)
 	}
 	assertNoSecrets(t, "error", err.Error())
+}
+
+// --- oshirase auth smtp
+
+// authSMTPSetup is a fake SMTP server and a configuration path that holds
+// a Fastmail OAuth grant in the keyring (item grant-old), as before
+// switching to SMTP.
+func authSMTPSetup(t *testing.T) (*fakeSMTP, string, []byte) {
+	t.Helper()
+	freshKeyring(t)
+	server := newFakeSMTP(t, true)
+	old := emailConfig{
+		Provider: providerFastmail, To: "phone@example.com", From: "me@fastmail.com",
+		TokenEndpoint: "https://token.example", ClientID: "dyn-client", JMAPSession: "https://jmap.example/session",
+		Secrets: secretsInKeyring, GrantID: "grant-old",
+	}
+	path := writeConfig(t, old)
+	if err := keyringStore.set(context.Background(), "grant-old", emailSecrets{RefreshToken: secretRefresh}); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(path)
+	return server, path, before
+}
+
+func TestAuthSMTPStoresInTheKeyring(t *testing.T) {
+	logs := captureLog(t)
+	server, path, _ := authSMTPSetup(t)
+	var report strings.Builder
+	args := []string{"-host", "127.0.0.1:465", "-username", "me@fastmail.com", "-to", "phone@example.com", "-config", path}
+	if err := authSMTP(context.Background(), args, strings.NewReader(secretSMTPPassword+"\n"), &report, server.transport()); err != nil {
+		t.Fatal(err)
+	}
+
+	// The probe logged in and out, and sent nothing.
+	got := server.state()
+	if !slices.Equal(got.commands, []string{"EHLO", "AUTH", "QUIT"}) {
+		t.Errorf("probe commands = %v", got.commands)
+	}
+	if len(got.logins) != 1 || got.logins[0] != "me@fastmail.com:"+secretSMTPPassword {
+		t.Errorf("logins = %q", got.logins)
+	}
+
+	data, _ := os.ReadFile(path)
+	assertNoSecrets(t, "email.json", string(data))
+	assertNoSecrets(t, "report", report.String())
+	assertNoSecrets(t, "log", logs.String())
+	saved, _, err := loadEmailConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Provider != providerSMTP || saved.From != "me@fastmail.com" || saved.SMTPHost != "127.0.0.1:465" ||
+		!saved.inKeyring() || saved.GrantID == "grant-old" {
+		t.Errorf("saved = %+v", saved)
+	}
+	if item, ok := keyringItem(t, saved.GrantID); !ok || item != (emailSecrets{SMTPPassword: secretSMTPPassword}) {
+		t.Errorf("item = %+v, %v", item, ok)
+	}
+	if _, ok := keyringItem(t, "grant-old"); ok {
+		t.Error("the Fastmail grant's item is still there")
+	}
+	for _, want := range []string{"Saved the SMTP password", keyringUser(saved.GrantID), path, "revoke it in Fastmail's settings"} {
+		if !strings.Contains(report.String(), want) {
+			t.Errorf("report lacks %q: %s", want, report.String())
+		}
+	}
+
+	// The daemon sends with what was stored.
+	backend, err := newEmailBackend(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend.smtpNet = server.transport()
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	if sent := len(server.state().messages); sent != 1 {
+		t.Errorf("sent %d", sent)
+	}
+}
+
+func TestAuthSMTPProbeFailureSavesNothing(t *testing.T) {
+	server, path, before := authSMTPSetup(t)
+	server.set(func(f *fakeSMTP) { f.password = "another" })
+	var report strings.Builder
+	args := []string{"-host", "127.0.0.1:465", "-username", "me@fastmail.com", "-to", "phone@example.com", "-config", path}
+	err := authSMTP(context.Background(), args, strings.NewReader(secretSMTPPassword+"\n"), &report, server.transport())
+	if err == nil || !strings.Contains(err.Error(), "nothing saved") || !strings.Contains(err.Error(), "535") {
+		t.Fatalf("err = %v", err)
+	}
+	assertNoSecrets(t, "error", err.Error())
+	assertNoSecrets(t, "report", report.String())
+	if server.saw("MAIL") || server.saw("DATA") {
+		t.Errorf("the probe went on to send: %v", server.state().commands)
+	}
+	if after, _ := os.ReadFile(path); string(after) != string(before) {
+		t.Errorf("email.json changed:\n%s", after)
+	}
+	if _, ok := keyringItem(t, "grant-old"); !ok {
+		t.Error("the previous grant's item was deleted")
+	}
+}
+
+func TestAuthSMTPInAFile(t *testing.T) {
+	freshKeyring(t)
+	server := newFakeSMTP(t, false)
+	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
+	var report strings.Builder
+	args := []string{"-host", "127.0.0.1:587", "-username", "login-name", "-from", "Me <me@example.com>",
+		"-to", "phone@example.com", "-config", path, "-store", "file"}
+	// A password manager's pipe, with spaces in the password and a CRLF.
+	password := " spaced SECRET "
+	server.set(func(f *fakeSMTP) { f.password = password })
+	if err := authSMTP(context.Background(), args, strings.NewReader(password+"\r\n"), &report, server.transport()); err != nil {
+		t.Fatal(err)
+	}
+	if got := server.state(); !server.saw("STARTTLS") || got.plainAuth || got.logins[0] != "login-name:"+password {
+		t.Errorf("commands %v, logins %q", got.commands, got.logins)
+	}
+	info, _ := os.Stat(path)
+	saved, _, err := loadEmailConfig(path)
+	if err != nil || info.Mode().Perm() != 0o600 || saved.SMTPPassword != password || saved.Username != "login-name" || saved.From != "Me <me@example.com>" {
+		t.Errorf("saved %+v (mode %o), %v", saved, info.Mode().Perm(), err)
+	}
+	assertNoSecrets(t, "report", report.String())
+	if !strings.Contains(report.String(), "everything in "+path) {
+		t.Errorf("report = %s", report.String())
+	}
+}
+
+func TestAuthSMTPFlags(t *testing.T) {
+	freshKeyring(t)
+	path := filepath.Join(t.TempDir(), "email.json")
+	cases := map[string]struct {
+		args []string
+		want string
+	}{
+		"no host":           {[]string{"-username", "me@example.com", "-to", "p@example.com"}, "-host"},
+		"no port":           {[]string{"-host", "smtp.example.com", "-username", "me@example.com", "-to", "p@example.com"}, "-host"},
+		"username not addr": {[]string{"-host", "smtp.example.com:465", "-username", "me", "-to", "p@example.com"}, "give -from"},
+		"no to":             {[]string{"-host", "smtp.example.com:465", "-username", "me@example.com"}, "-to is required"},
+		"bad store":         {[]string{"-host", "smtp.example.com:465", "-username", "me@example.com", "-to", "p@example.com", "-store", "x"}, "-store"},
+		"password as arg":   {[]string{"-host", "smtp.example.com:465", "-username", "me@example.com", "-to", "p@example.com", secretSMTPPassword}, "never from the command line"},
+	}
+	for name, c := range cases {
+		var report strings.Builder
+		transport := smtpTransport{dial: func(context.Context, string, string) (net.Conn, error) {
+			t.Errorf("%s: connected", name)
+			return nil, errors.New("no")
+		}}
+		args := append(c.args, "-config", path)
+		if c.args[len(c.args)-1] == secretSMTPPassword {
+			args = append([]string{"-config", path}, c.args...)
+		}
+		err := authSMTP(context.Background(), args, strings.NewReader(secretSMTPPassword+"\n"), &report, transport)
+		if err == nil || !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%s: err = %v", name, err)
+			continue
+		}
+		assertNoSecrets(t, name+": error", err.Error())
+		assertNoSecrets(t, name+": report", report.String())
+	}
+	if _, err := os.Stat(path); err == nil {
+		t.Error("a configuration was written")
+	}
+}
+
+func TestReadSMTPPassword(t *testing.T) {
+	for input, want := range map[string]string{"pw\n": "pw", "pw\r\n": "pw", "pw": "pw", "a b \n": "a b ", "first\nsecond\n": "first"} {
+		got, err := readSMTPPassword(strings.NewReader(input), io.Discard, "u", "h:465")
+		if err != nil || got != want {
+			t.Errorf("%q: %q, %v", input, got, err)
+		}
+	}
+	for _, input := range []string{"", "\n"} {
+		if _, err := readSMTPPassword(strings.NewReader(input), io.Discard, "u", "h:465"); err == nil {
+			t.Errorf("%q: accepted", input)
+		}
+	}
 }
