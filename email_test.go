@@ -35,6 +35,7 @@ type fakeTokenEndpoint struct {
 	rotate   bool
 	failure  string // a JSON error body to answer with, status 400
 	hold     func() // runs before answering, e.g. to make the caller give up
+	rotateTo string // after this answer, accept this refresh token instead
 	requests int
 	access   []string // access tokens it has issued
 }
@@ -67,8 +68,12 @@ func (f *fakeTokenEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	f.access = append(f.access, access)
 	response := map[string]any{"access_token": access, "token_type": "Bearer", "expires_in": 3600}
 	if f.rotate {
+		response["refresh_token"] = f.current + "-next"
 		f.current = f.current + "-next"
-		response["refresh_token"] = f.current
+		if f.rotateTo != "" {
+			// Something else (a new grant) is what is valid from now on.
+			f.current, f.rotateTo = f.rotateTo, ""
+		}
 	}
 	json.NewEncoder(w).Encode(response)
 }
@@ -76,7 +81,7 @@ func (f *fakeTokenEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func writeConfig(t *testing.T, config emailConfig) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
-	if err := saveEmailConfig(path, &config); err != nil {
+	if _, err := saveEmailConfig(path, &config); err != nil {
 		t.Fatal(err)
 	}
 	return path
@@ -641,8 +646,8 @@ func TestConfigReloadsAfterAuth(t *testing.T) {
 	tokens.current = "refresh-SECRET-2"
 	config := *backend.config
 	config.RefreshToken = "refresh-SECRET-2"
-	time.Sleep(10 * time.Millisecond) // a distinct mtime
-	if err := saveEmailConfig(backend.path, &config); err != nil {
+	// No pause for a distinct mtime: a new write is a new file.
+	if _, err := saveEmailConfig(backend.path, &config); err != nil {
 		t.Fatal(err)
 	}
 	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
@@ -661,7 +666,7 @@ func TestSaveTightensTheDirectory(t *testing.T) {
 		t.Fatal(err)
 	}
 	path := filepath.Join(dir, "email.json")
-	if err := saveEmailConfig(path, &emailConfig{Provider: providerGoogle}); err != nil {
+	if _, err := saveEmailConfig(path, &emailConfig{Provider: providerGoogle}); err != nil {
 		t.Fatal(err)
 	}
 	for name, want := range map[string]os.FileMode{dir: 0o700, path: 0o600} {
@@ -677,11 +682,67 @@ func TestSaveTightensTheDirectory(t *testing.T) {
 	// A directory that is not oshirase's own is left alone.
 	other := t.TempDir()
 	os.Chmod(other, 0o755)
-	if err := saveEmailConfig(filepath.Join(other, "email.json"), &emailConfig{}); err != nil {
+	if _, err := saveEmailConfig(filepath.Join(other, "email.json"), &emailConfig{}); err != nil {
 		t.Fatal(err)
 	}
 	if info, _ := os.Stat(other); info.Mode().Perm() != 0o755 {
 		t.Errorf("changed %s to %o", other, info.Mode().Perm())
+	}
+}
+
+// `oshirase auth` replacing the file while the daemon refreshes the old
+// grant wins: the daemon neither writes the old grant back nor misses the
+// new one.
+func TestAuthDuringRefreshKeepsTheNewGrant(t *testing.T) {
+	backend, tokens, jmap := fastmailSetup(t)
+	fresh := *backend.config
+	fresh.RefreshToken = "fresh-grant-SECRET"
+	tokens.hold = func() {
+		tokens.hold = nil
+		if _, err := saveEmailConfig(backend.path, &fresh); err != nil {
+			t.Error(err)
+		}
+		// The old grant rotates as this refresh answers; the new grant is
+		// the one the endpoint accepts next.
+		tokens.rotateTo = fresh.RefreshToken
+	}
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	if len(jmap.sent) != 1 {
+		t.Errorf("sent %d", len(jmap.sent))
+	}
+	// The send refreshed again with the new grant, whose rotated token is
+	// what the file holds now; the old grant's was never written.
+	saved, _, err := loadEmailConfig(backend.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.RefreshToken != "fresh-grant-SECRET-next" || backend.config.RefreshToken != saved.RefreshToken {
+		t.Errorf("file holds %q, daemon %q; want the new grant, rotated", saved.RefreshToken, backend.config.RefreshToken)
+	}
+	if tokens.requests != 2 {
+		t.Errorf("%d refreshes, want 2 (old grant, then new)", tokens.requests)
+	}
+}
+
+// After its own save the daemon does not reload (it has nothing new to
+// read), but a write by anyone else right after is still seen.
+func TestOwnSaveIsNotAChange(t *testing.T) {
+	backend, _, _ := fastmailSetup(t)
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	info, _ := os.Stat(backend.path)
+	if !sameVersion(backend.loaded, info) {
+		t.Error("the daemon's own save counts as a change")
+	}
+	other := *backend.config
+	other.RefreshToken = "other"
+	saveEmailConfig(backend.path, &other)
+	info, _ = os.Stat(backend.path)
+	if sameVersion(backend.loaded, info) {
+		t.Error("another write right after the daemon's is not seen")
 	}
 }
 

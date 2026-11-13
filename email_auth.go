@@ -120,7 +120,7 @@ func runAuthGoogle(ctx context.Context, args []string) error {
 		return err
 	}
 	config.To, config.From = *to, *from
-	if err := saveEmailConfig(path, config); err != nil {
+	if _, err := saveEmailConfig(path, config); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Saved the grant to %s.\nStart the daemon with: oshirase serve -backend email\n", path)
@@ -237,7 +237,7 @@ func runAuthFastmail(ctx context.Context, args []string) error {
 	if err := resolveFastmailIdentity(ctx, path, config, access, http.DefaultClient); err != nil {
 		return err
 	}
-	if err := saveEmailConfig(path, config); err != nil {
+	if _, err := saveEmailConfig(path, config); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Saved to %s; notifications will be sent as %s to %s.\nStart the daemon with: oshirase serve -backend email\n", path, config.From, config.To)

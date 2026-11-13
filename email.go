@@ -117,19 +117,22 @@ func emailConfigPath() (string, error) {
 	return filepath.Join(dir, "oshirase", "email.json"), nil
 }
 
-func loadEmailConfig(path string) (*emailConfig, time.Time, error) {
+// loadEmailConfig also returns what the file was when read: the stat of
+// the open file, so it describes the content decoded and not whatever
+// replaced it a moment later.
+func loadEmailConfig(path string) (*emailConfig, os.FileInfo, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, time.Time{}, fmt.Errorf("no email configuration at %s; run oshirase auth google or oshirase auth fastmail", path)
+		return nil, nil, fmt.Errorf("no email configuration at %s; run oshirase auth google or oshirase auth fastmail", path)
 	}
 	if err != nil {
-		return nil, time.Time{}, err
+		return nil, nil, err
 	}
 	defer file.Close()
 
 	info, err := file.Stat()
 	if err != nil {
-		return nil, time.Time{}, err
+		return nil, nil, err
 	}
 	if info.Mode().Perm()&0o077 != 0 {
 		log.Printf("warning: %s is readable by others (mode %o); it holds a credential, chmod 600 it", path, info.Mode().Perm())
@@ -138,20 +141,23 @@ func loadEmailConfig(path string) (*emailConfig, time.Time, error) {
 	var config emailConfig
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&config); err != nil {
-		return nil, time.Time{}, fmt.Errorf("reading %s: %w", path, err)
+		return nil, nil, fmt.Errorf("reading %s: %w", path, err)
 	}
 	if err := config.validate(); err != nil {
-		return nil, time.Time{}, fmt.Errorf("%s: %w", path, err)
+		return nil, nil, fmt.Errorf("%s: %w", path, err)
 	}
-	return &config, info.ModTime(), nil
+	return &config, info, nil
 }
 
 // saveEmailConfig replaces the file atomically, so a daemon reading it, or
-// a crash halfway, never sees half a refresh token.
-func saveEmailConfig(path string, config *emailConfig) error {
+// a crash halfway, never sees half a refresh token. It returns what it
+// wrote, taken from the temporary file before the rename (which keeps the
+// inode and the modification time): a stat of the path after the rename
+// could already be describing someone else's write.
+func saveEmailConfig(path string, config *emailConfig) (os.FileInfo, error) {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return err
+		return nil, err
 	}
 	// MkdirAll leaves an existing directory as it is, and an installer may
 	// have made it 0755 for other files. Tighten it when it is oshirase's
@@ -159,34 +165,42 @@ func saveEmailConfig(path string, config *emailConfig) error {
 	// say) is the person's business, and the file is 0600 regardless.
 	if filepath.Base(dir) == "oshirase" {
 		if err := os.Chmod(dir, 0o700); err != nil {
-			return err
+			return nil, err
 		}
 	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	temp, err := os.CreateTemp(dir, ".email-*.json")
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer os.Remove(temp.Name()) // a no-op once renamed
 	if err := temp.Chmod(0o600); err != nil {
 		temp.Close()
-		return err
+		return nil, err
 	}
 	if _, err := temp.Write(append(data, '\n')); err != nil {
 		temp.Close()
-		return err
+		return nil, err
 	}
 	if err := temp.Sync(); err != nil {
 		temp.Close()
-		return err
+		return nil, err
+	}
+	written, err := temp.Stat()
+	if err != nil {
+		temp.Close()
+		return nil, err
 	}
 	if err := temp.Close(); err != nil {
-		return err
+		return nil, err
 	}
-	return os.Rename(temp.Name(), path)
+	if err := os.Rename(temp.Name(), path); err != nil {
+		return nil, err
+	}
+	return written, nil
 }
 
 // openEmailBackend is what -backend email selects. Unlike the macOS
@@ -201,14 +215,14 @@ func openEmailBackend() (Backend, error) {
 }
 
 func newEmailBackend(path string) (*emailBackend, error) {
-	config, modTime, err := loadEmailConfig(path)
+	config, loaded, err := loadEmailConfig(path)
 	if err != nil {
 		return nil, err
 	}
 	return &emailBackend{
 		path:         path,
 		config:       config,
-		modTime:      modTime,
+		loaded:       loaded,
 		http:         &http.Client{},
 		gmailSendURL: gmailSendURL,
 	}, nil
@@ -227,13 +241,13 @@ type emailBackend struct {
 	// mu serializes deliveries. Notifications are rare, and serializing
 	// keeps at most one refresh in flight, which Fastmail requires of a
 	// rotating refresh token.
-	mu      sync.Mutex
-	config  *emailConfig
-	modTime time.Time
-	access  string
-	expiry  time.Time
-	jmap    *jmapAccount // what the JMAP session said, cached
-	recent  []time.Time  // when the sends of the last minute started
+	mu     sync.Mutex
+	config *emailConfig
+	loaded os.FileInfo // the file config came from; nil to reload it
+	access string
+	expiry time.Time
+	jmap   *jmapAccount // what the JMAP session said, cached
+	recent []time.Time  // when the sends of the last minute started
 }
 
 func (b *emailBackend) Name() string { return "email" }
@@ -289,17 +303,25 @@ func (b *emailBackend) reloadIfChanged() error {
 	if err != nil {
 		return fmt.Errorf("email configuration: %w", err)
 	}
-	if info.ModTime().Equal(b.modTime) {
+	if sameVersion(b.loaded, info) {
 		return nil
 	}
-	config, modTime, err := loadEmailConfig(b.path)
+	config, loaded, err := loadEmailConfig(b.path)
 	if err != nil {
 		return err
 	}
-	b.config, b.modTime = config, modTime
+	b.config, b.loaded = config, loaded
 	b.access, b.expiry, b.jmap = "", time.Time{}, nil
 	log.Printf("email: reloaded %s (provider %s)", b.path, config.Provider)
 	return nil
+}
+
+// sameVersion tells whether two stats are of the same write of the file.
+// Every save renames a new file into place, so a new write is a new inode;
+// the modification time and size guard against a reused one.
+func sameVersion(old, current os.FileInfo) bool {
+	return old != nil && os.SameFile(old, current) &&
+		old.ModTime().Equal(current.ModTime()) && old.Size() == current.Size()
 }
 
 func (b *emailBackend) clock() time.Time {
@@ -312,13 +334,36 @@ func (b *emailBackend) clock() time.Time {
 // accessToken returns a bearer token for the provider's API, refreshing it
 // when it is about to expire.
 func (b *emailBackend) accessToken(ctx context.Context) (string, error) {
-	if b.config.APIToken != "" {
-		return b.config.APIToken, nil
+	for attempt := 0; ; attempt++ {
+		if b.config.APIToken != "" {
+			return b.config.APIToken, nil
+		}
+		if b.access != "" && b.clock().Before(b.expiry.Add(-time.Minute)) {
+			return b.access, nil
+		}
+		replaced, err := b.refresh(ctx)
+		if err != nil {
+			return "", err
+		}
+		if !replaced {
+			return b.access, nil
+		}
+		// `oshirase auth` wrote a new grant during the refresh: load it
+		// and refresh with that one instead.
+		if attempt > 0 {
+			return "", fmt.Errorf("%s keeps changing during token refreshes; try again", b.path)
+		}
+		if err := b.reloadIfChanged(); err != nil {
+			return "", err
+		}
 	}
-	if b.access != "" && b.clock().Before(b.expiry.Add(-time.Minute)) {
-		return b.access, nil
-	}
+}
 
+// refresh exchanges the refresh token for an access token, and saves a
+// rotated refresh token. It reports replaced, and changes nothing, when the
+// file turned out to hold a different grant by the time the refresh came
+// back.
+func (b *emailBackend) refresh(ctx context.Context) (replaced bool, err error) {
 	client := oauthClient{
 		TokenEndpoint: b.config.TokenEndpoint,
 		ClientID:      b.config.ClientID,
@@ -334,7 +379,30 @@ func (b *emailBackend) accessToken(ctx context.Context) (string, error) {
 	defer cancel()
 	token, err := client.refresh(refreshCtx, b.config.RefreshToken)
 	if err != nil {
-		return "", b.refreshFailure(err)
+		return false, b.refreshFailure(err)
+	}
+
+	// Fastmail rotates the refresh token on every use and revokes the grant
+	// if the old one is used again, so the new one has to reach the file
+	// before anything else can go wrong.
+	if token.RefreshToken != "" && token.RefreshToken != b.config.RefreshToken {
+		// Unless `oshirase auth` replaced the file during the refresh: its
+		// grant is newer than the one just rotated, and writing ours back
+		// would undo it. Keep the file and drop the old grant from memory.
+		// The check narrows the race to the moment between it and the
+		// rename; closing it would take a lock.
+		if current, err := os.Stat(b.path); err != nil || !sameVersion(b.loaded, current) {
+			log.Printf("email: %s changed during a token refresh; keeping the file's grant", b.path)
+			b.loaded, b.access, b.expiry, b.jmap = nil, "", time.Time{}, nil
+			return true, nil
+		}
+		b.config.RefreshToken = token.RefreshToken
+		written, err := saveEmailConfig(b.path, b.config)
+		if err != nil {
+			log.Printf("warning: could not save the rotated refresh token to %s: %v; the grant will be lost when the daemon stops", b.path, err)
+		} else {
+			b.loaded = written
+		}
 	}
 
 	lifetime := time.Duration(token.ExpiresIn) * time.Second
@@ -342,19 +410,7 @@ func (b *emailBackend) accessToken(ctx context.Context) (string, error) {
 		lifetime = time.Hour // unstated; a 401 later forces a refresh anyway
 	}
 	b.access, b.expiry = token.AccessToken, b.clock().Add(lifetime)
-
-	// Fastmail rotates the refresh token on every use and revokes the grant
-	// if the old one is used again, so the new one has to reach the file
-	// before anything else can go wrong.
-	if token.RefreshToken != "" && token.RefreshToken != b.config.RefreshToken {
-		b.config.RefreshToken = token.RefreshToken
-		if err := saveEmailConfig(b.path, b.config); err != nil {
-			log.Printf("warning: could not save the rotated refresh token to %s: %v; the grant will be lost when the daemon stops", b.path, err)
-		} else if info, err := os.Stat(b.path); err == nil {
-			b.modTime = info.ModTime()
-		}
-	}
-	return b.access, nil
+	return false, nil
 }
 
 // refreshFailure turns a token endpoint's refusal into what the person has
