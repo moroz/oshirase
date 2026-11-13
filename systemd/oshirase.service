@@ -1,0 +1,19 @@
+# systemd user unit; install-linux.sh copies it to
+# ~/.config/systemd/user/ and writes the environment file it reads.
+[Unit]
+Description=oshirase notification daemon
+Documentation=https://github.com/moroz/oshirase
+# The notification service lives in the graphical session.
+After=graphical-session.target
+
+[Service]
+# OSHIRASE_LISTEN: loopback plus the VM bridge addresses found at install.
+EnvironmentFile=-%h/.config/oshirase/env
+ExecStart=%h/.local/bin/oshirase serve
+# A bridge address that is not up yet (libvirt's network starting late) fails
+# the bind; retry until it is.
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target

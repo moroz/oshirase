@@ -12,7 +12,8 @@ oshirase send "Touch the YubiKey" "git push origin"   # in the guest
 ```
 
 The daemon keeps a stable HTTP protocol and hides how each platform shows a
-notification. Today that is macOS, through Oshirase.app (below).
+notification: macOS through Oshirase.app, and a Linux desktop through its
+freedesktop.org notification service (both below).
 
 ## Install on macOS
 
@@ -40,6 +41,36 @@ whether a Focus is holding its notifications back.
 The app is signed with `$OSHIRASE_SIGN_IDENTITY`, else the first "Apple
 Development" identity in the keychain, else ad hoc.
 
+## Install on Linux
+
+```sh
+./install-linux.sh            # builds with Go from mise.toml, then installs
+./install-linux.sh ./oshirase # or install a binary built elsewhere
+```
+
+That puts the binary at `~/.local/bin/oshirase` and installs the systemd user
+service `oshirase.service` (started with the session, restarted if it exits);
+it logs to the journal (`journalctl --user -u oshirase`).
+
+The daemon shows notifications through the freedesktop.org notification
+service on the session bus, which GNOME, Cinnamon, KDE, XFCE, dunst and mako
+all provide. It calls it with `busctl`, which comes with systemd, so it needs
+no D-Bus library. The source goes on the first line of the body, in italics
+where the server renders markup, since the specification has no subtitle.
+`critical` asks the server to keep the notification until it is dismissed.
+With no notification service running, the daemon answers 502 with the
+reason.
+
+The installer has the daemon listen on loopback and on every libvirt bridge
+(`virbr*`) address, written to `~/.config/oshirase/env` as
+`OSHIRASE_LISTEN`; set `OSHIRASE_LISTEN` when running the installer to choose
+the addresses yourself. A host firewall usually drops a guest's connections
+to the host, so allow the port on the bridge, e.g. with ufw:
+
+```sh
+sudo ufw allow in on virbr0 to 192.168.122.1 port 4649 proto tcp comment 'oshirase from libvirt guests'
+```
+
 ## Install in the guest
 
 ```sh
@@ -62,9 +93,13 @@ often than the binary.
 
 ## Reaching it from the guest
 
-The daemon listens on `127.0.0.1:4649` only, so nothing else on the network
-can reach it. A Lima guest reaches the host's loopback as
-`host.lima.internal`, which is `oshirase send`'s default. Elsewhere, set
+The daemon listens on `127.0.0.1:4649` by default, so nothing else on the
+network can reach it. A Lima guest reaches the host's loopback as
+`host.lima.internal`, which is `oshirase send`'s default. A libvirt guest
+cannot reach the host's loopback; the daemon listens on the bridge as well
+(`-listen` takes several addresses separated by commas, and
+`install-linux.sh` sets that up), and the guest sets
+`OSHIRASE_URL=http://192.168.122.1:4649`, its gateway. Elsewhere, set
 `OSHIRASE_URL` (or `-url`).
 
 `oshirase send` exits non-zero when the daemon did not answer or refused, so a

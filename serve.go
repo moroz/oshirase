@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"log"
 	"mime"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -22,8 +24,9 @@ const notifyTimeout = 10 * time.Second
 
 func runServe(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	listen := flags.String("listen", envOr("OSHIRASE_LISTEN", defaultListen), "address to listen on")
-	backendName := flags.String("backend", "auto", "auto, log, or a platform backend (macos)")
+	listen := flags.String("listen", envOr("OSHIRASE_LISTEN", defaultListen),
+		"address to listen on; several separated by commas, e.g. a VM bridge's besides loopback")
+	backendName := flags.String("backend", "auto", "auto, log, or a platform backend (macos, freedesktop)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -38,31 +41,74 @@ func runServe(args []string) error {
 	mux.HandleFunc("POST /v1/notify", notifyHandler(backend))
 
 	server := &http.Server{
-		Addr:              *listen,
 		Handler:           rejectBrowsers(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      notifyTimeout + 5*time.Second,
 	}
 
+	// Bind every address before serving any, so a daemon that cannot have
+	// all of them fails at once (and its supervisor retries) rather than
+	// running half-reachable.
+	listeners, err := listenAll(listenAddresses(*listen))
+	if err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	serveErr := make(chan error, 1)
-	go func() {
-		log.Printf("oshirase %s listening on %s, backend %s", version, *listen, backend.Name())
-		serveErr <- server.ListenAndServe()
-	}()
+	serveErr := make(chan error, len(listeners))
+	for _, listener := range listeners {
+		go func() {
+			log.Printf("oshirase %s listening on %s, backend %s", version, listener.Addr(), backend.Name())
+			serveErr <- server.Serve(listener)
+		}()
+	}
 
-	select {
-	case err := <-serveErr:
-		return err
-	case <-ctx.Done():
-		log.Print("shutting down")
+	shutdown := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
 	}
+	select {
+	case err := <-serveErr:
+		// One listener failing takes the others down with it.
+		_ = shutdown()
+		return err
+	case <-ctx.Done():
+		log.Print("shutting down")
+		return shutdown()
+	}
+}
+
+// listenAddresses splits a comma-separated -listen value, dropping blanks.
+func listenAddresses(value string) []string {
+	var addresses []string
+	for _, address := range strings.Split(value, ",") {
+		if address = strings.TrimSpace(address); address != "" {
+			addresses = append(addresses, address)
+		}
+	}
+	return addresses
+}
+
+func listenAll(addresses []string) ([]net.Listener, error) {
+	if len(addresses) == 0 {
+		return nil, errors.New("no address to listen on")
+	}
+	var listeners []net.Listener
+	for _, address := range addresses {
+		listener, err := net.Listen("tcp", address)
+		if err != nil {
+			for _, open := range listeners {
+				open.Close()
+			}
+			return nil, err
+		}
+		listeners = append(listeners, listener)
+	}
+	return listeners, nil
 }
 
 // rejectBrowsers turns away anything a web page could send. A page on the
