@@ -93,6 +93,21 @@ func (b *emailBackend) postGmail(ctx context.Context, token string, payload []by
 	return response.StatusCode, detail, nil
 }
 
+// encodeSubject Q-encodes a subject that is not plain ASCII and folds it
+// between the encoded words. Each word is at most 75 characters, but a
+// title of 256 CJK characters makes dozens of them, and on one line they
+// would pass the 998-character limit of RFC 5322 §2.1.1. Q-encoding writes
+// a space as "_", so the only spaces in the result are the ones between
+// words, where a fold may go. It also encodes every control character, so
+// nothing in the title can start a header of its own.
+func encodeSubject(subject string) string {
+	encoded := mime.QEncoding.Encode("utf-8", subject)
+	if encoded == subject {
+		return subject // plain ASCII, at most a few hundred characters
+	}
+	return strings.ReplaceAll(encoded, " ", "\r\n ")
+}
+
 // buildRFC5322 writes a plain-text UTF-8 message. Gmail fills in From (as
 // the authorized account) when it is empty, and Message-ID.
 func buildRFC5322(from, to string, message emailMessage, now time.Time) []byte {
@@ -104,9 +119,7 @@ func buildRFC5322(from, to string, message emailMessage, now time.Time) []byte {
 		header("From", (&mail.Address{Name: "oshirase", Address: from}).String())
 	}
 	header("To", (&mail.Address{Address: to}).String())
-	// Q-encoding also encodes any control character, so nothing in the
-	// title can start a header of its own.
-	header("Subject", mime.QEncoding.Encode("utf-8", message.Subject))
+	header("Subject", encodeSubject(message.Subject))
 	header("Date", now.Format(time.RFC1123Z))
 	header("MIME-Version", "1.0")
 	header("Content-Type", "text/plain; charset=utf-8")

@@ -308,6 +308,35 @@ func TestSubjectCannotInjectHeaders(t *testing.T) {
 	}
 }
 
+// A long non-ASCII subject is folded between encoded words, so no header
+// line passes RFC 5322's 998 characters. (The first line, "Subject: " and
+// a 75-character word, may pass the 78 the RFC recommends.)
+func TestLongSubjectIsFolded(t *testing.T) {
+	n := Notification{Title: strings.Repeat("通知", 128), Source: strings.Repeat("é", 64)}
+	message := composeEmail(n)
+	raw := buildRFC5322("", "me@example.com", message, time.Now())
+	header, _, _ := bytes.Cut(raw, []byte("\r\n\r\n"))
+	for _, line := range strings.Split(string(header), "\r\n") {
+		if len(line) > 9+75 {
+			t.Errorf("header line of %d characters: %.60s...", len(line), line)
+		}
+	}
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	subject, err := new(mime.WordDecoder).DecodeHeader(parsed.Header.Get("Subject"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if subject != message.Subject {
+		t.Errorf("subject came back as %q", subject)
+	}
+	if encodeSubject("[oshirase] plain") != "[oshirase] plain" {
+		t.Error("a plain ASCII subject should go as it is")
+	}
+}
+
 // --- Fastmail / JMAP
 
 type fakeJMAP struct {

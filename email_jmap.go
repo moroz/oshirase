@@ -46,6 +46,8 @@ func (b *emailBackend) sendJMAP(ctx context.Context, message emailMessage) error
 		"keywords":   map[string]bool{"$draft": true, "$seen": true},
 		"from":       []map[string]string{{"name": "oshirase", "email": account.From}},
 		"to":         []map[string]string{{"email": b.config.To}},
+		// JMAP takes the subject as text; the server writes the header,
+		// encoding and folding it (RFC 8621: subject is header:Subject:asText).
 		"subject":    message.Subject,
 		"bodyValues": map[string]any{"body": map[string]string{"value": message.Body}},
 		"textBody":   []map[string]string{{"partId": "body", "type": "text/plain"}},
