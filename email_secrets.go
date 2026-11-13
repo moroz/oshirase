@@ -18,8 +18,8 @@ import (
 )
 
 // Where the email backend's secrets live. With "secrets": "keyring" in
-// email.json, the refresh token, API token and client secret are in the
-// OS keyring (the Secret Service on Linux, the default Keychain, normally
+// email.json, the refresh token, API token, client secret and SMTP password
+// are in the OS keyring (the Secret Service on Linux, the default Keychain, normally
 // the login one, on macOS), in one item per grant, and email.json holds
 // only the grant's id. With "file", or no "secrets" at all (configurations
 // from before the keyring), they are in email.json itself.
@@ -35,14 +35,15 @@ type emailSecrets struct {
 	RefreshToken string `json:"refresh_token,omitempty"`
 	APIToken     string `json:"api_token,omitempty"`
 	ClientSecret string `json:"client_secret,omitempty"`
+	SMTPPassword string `json:"smtp_password,omitempty"`
 }
 
 func (c *emailConfig) secrets() emailSecrets {
-	return emailSecrets{RefreshToken: c.RefreshToken, APIToken: c.APIToken, ClientSecret: c.ClientSecret}
+	return emailSecrets{RefreshToken: c.RefreshToken, APIToken: c.APIToken, ClientSecret: c.ClientSecret, SMTPPassword: c.SMTPPassword}
 }
 
 func (c *emailConfig) setSecrets(s emailSecrets) {
-	c.RefreshToken, c.APIToken, c.ClientSecret = s.RefreshToken, s.APIToken, s.ClientSecret
+	c.RefreshToken, c.APIToken, c.ClientSecret, c.SMTPPassword = s.RefreshToken, s.APIToken, s.ClientSecret, s.SMTPPassword
 }
 
 func (c *emailConfig) inKeyring() bool { return c.Secrets == secretsInKeyring }

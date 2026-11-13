@@ -24,20 +24,30 @@ import (
 const (
 	providerGoogle   = "google"
 	providerFastmail = "fastmail"
+	providerSMTP     = "smtp"
 )
 
 // emailConfig is the file `oshirase auth` writes and the daemon reads. The
-// secrets in it (refresh_token, api_token, client_secret) are in the file
-// only when Secrets is "file" or empty; with "keyring" they are in the OS
-// keyring and the daemon fills them in from there. Either way the file is
-// written with mode 0600 in a directory with mode 0700.
+// secrets in it (refresh_token, api_token, client_secret, smtp_password)
+// are in the file only when Secrets is "file" or empty; with "keyring" they
+// are in the OS keyring and the daemon fills them in from there. Either way
+// the file is written with mode 0600 in a directory with mode 0700.
 type emailConfig struct {
-	Provider string `json:"provider"` // google or fastmail
+	Provider string `json:"provider"` // google, fastmail or smtp
 	To       string `json:"to"`
 	// From is required for Fastmail (it picks the sending identity, and
-	// `oshirase auth fastmail` fills it in) and optional for Google, where
-	// Gmail sends as the authorized account.
+	// `oshirase auth fastmail` fills it in) and SMTP (the envelope sender
+	// and From header), and optional for Google, where Gmail sends as the
+	// authorized account.
 	From string `json:"from,omitempty"`
+
+	// SMTP: the submission server as host:port (port 465 is TLS from the
+	// start, any other port must offer STARTTLS), the account to log in as
+	// (From when empty) and its password, normally an app password that
+	// can only send.
+	SMTPHost     string `json:"smtp_host,omitempty"`
+	Username     string `json:"username,omitempty"`
+	SMTPPassword string `json:"smtp_password,omitempty"`
 
 	// OAuth: the client the grant was made to and the refresh token from
 	// it. ClientSecret is empty for Fastmail, whose dynamically
@@ -97,9 +107,12 @@ func (c *emailConfig) validateShape() error {
 	}
 	// Stand-ins for the secrets, so the rest is checked as for a file.
 	full := *c
-	if c.Provider == providerFastmail && c.ClientID == "" {
+	switch {
+	case c.Provider == providerSMTP:
+		full.SMTPPassword = "-"
+	case c.Provider == providerFastmail && c.ClientID == "":
 		full.APIToken = "-"
-	} else {
+	default:
 		full.RefreshToken, full.ClientSecret = "-", "-"
 	}
 	return full.validate()
@@ -122,8 +135,18 @@ func (c *emailConfig) validate() error {
 		if c.From == "" {
 			return errors.New("fastmail needs from, the address to send as")
 		}
+	case providerSMTP:
+		if err := checkSMTPHost(c.SMTPHost); err != nil {
+			return fmt.Errorf("smtp_host: %w", err)
+		}
+		if c.From == "" {
+			return errors.New("smtp needs from, the address to send as")
+		}
+		if c.SMTPPassword == "" {
+			return errors.New("smtp needs smtp_password")
+		}
 	default:
-		return fmt.Errorf("provider must be google or fastmail, not %q", c.Provider)
+		return fmt.Errorf("provider must be google, fastmail or smtp, not %q", c.Provider)
 	}
 	if c.MaxPerMinute < -1 {
 		return fmt.Errorf("max_per_minute must be a positive number, 0 for the default (%d) or -1 for no limit", defaultMaxPerMinute)
@@ -164,7 +187,7 @@ var errNoEmailConfig = errors.New("no email configuration")
 func loadEmailConfig(path string) (*emailConfig, os.FileInfo, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil, fmt.Errorf("%w at %s; run oshirase auth google or oshirase auth fastmail", errNoEmailConfig, path)
+		return nil, nil, fmt.Errorf("%w at %s; run oshirase auth google, fastmail or smtp", errNoEmailConfig, path)
 	}
 	if err != nil {
 		return nil, nil, err
@@ -313,6 +336,9 @@ type emailBackend struct {
 	expiry          time.Time
 	jmap            *jmapAccount // what the JMAP session said, cached
 	recent          []time.Time  // when the sends of the last minute started
+
+	// smtpNet is how SMTP connects; tests point it at a fake server.
+	smtpNet smtpTransport
 }
 
 func (b *emailBackend) Name() string { return "email" }
@@ -343,6 +369,8 @@ func (b *emailBackend) Notify(ctx context.Context, n Notification) error {
 		return b.sendGmail(ctx, message)
 	case providerFastmail:
 		return b.sendJMAP(ctx, message)
+	case providerSMTP:
+		return b.sendSMTP(ctx, message)
 	}
 	return fmt.Errorf("unknown provider %q", b.config.Provider)
 }
@@ -703,7 +731,8 @@ func (b *emailBackend) forgetAccessToken() {
 type emailMessage struct {
 	Subject string
 	Body    string
-	// Headers are extra header fields, in order: the priority ones.
+	// Headers are extra header fields, in order: the priority ones, and
+	// for SMTP a Message-ID.
 	Headers [][2]string
 }
 
