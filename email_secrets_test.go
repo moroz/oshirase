@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -521,5 +522,50 @@ func TestLateWriteIsFollowedByTheNewest(t *testing.T) {
 	defer backend.mu.Unlock()
 	if backend.unsaved != nil {
 		t.Errorf("unsaved still holds %q after it was written", backend.unsaved.token)
+	}
+}
+
+// Without a session bus, the keyring is not tried (godbus would run
+// dbus-launch), and the error says to use -store file.
+func TestNoSessionBus(t *testing.T) {
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	runUser := t.TempDir()
+	runtimeDir := t.TempDir()
+	t.Setenv("XDG_RUNTIME_DIR", runtimeDir)
+
+	err := findSessionBus("linux", runUser)
+	if !errors.Is(err, errNoSessionBus) {
+		t.Fatalf("err = %v", err)
+	}
+	message := keyringFailure(err, &emailConfig{Provider: providerGoogle}).Error()
+	if !strings.Contains(message, "no D-Bus session bus, so no Secret Service") || !strings.Contains(message, "run oshirase auth google -store file") {
+		t.Errorf("message = %q", message)
+	}
+	if findSessionBus("darwin", runUser) != nil {
+		t.Error("macOS needs no session bus")
+	}
+
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "autolaunch:")
+	if findSessionBus("linux", runUser) == nil {
+		t.Error("autolaunch: counted as a bus; godbus would run dbus-launch for it")
+	}
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path=/somewhere")
+	if err := findSessionBus("linux", runUser); err != nil {
+		t.Errorf("with an address: %v", err)
+	}
+
+	t.Setenv("DBUS_SESSION_BUS_ADDRESS", "")
+	os.WriteFile(filepath.Join(runUser, "bus"), nil, 0o600)
+	if err := findSessionBus("linux", runUser); err != nil {
+		t.Errorf("with /run/user/<uid>/bus: %v", err)
+	}
+	os.Remove(filepath.Join(runUser, "bus"))
+
+	os.WriteFile(filepath.Join(runtimeDir, "bus"), nil, 0o600)
+	if err := findSessionBus("linux", runUser); err != nil {
+		t.Errorf("with $XDG_RUNTIME_DIR/bus: %v", err)
+	}
+	if got := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); got != "unix:path="+filepath.Join(runtimeDir, "bus") {
+		t.Errorf("DBUS_SESSION_BUS_ADDRESS = %q", got)
 	}
 }

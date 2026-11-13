@@ -192,7 +192,12 @@ it, not longer, and does not ask again while that prompt is open.
 
 **Headless machines.** Where there is no keyring, `oshirase auth ...
 -store file` keeps the secrets in `email.json` itself (mode 0600,
-`"secrets": "file"`), as before. A configuration written before the
+`"secrets": "file"`), as before. On Linux, a session with no D-Bus session
+bus (no `DBUS_SESSION_BUS_ADDRESS`, no socket at `/run/user/<uid>/bus` or
+`$XDG_RUNTIME_DIR/bus`: an SSH login without a user systemd, a container,
+cron) has no Secret Service to reach, and oshirase says so ("no D-Bus
+session bus, so no Secret Service; run oshirase auth ... -store file")
+rather than starting a bus of its own with `dbus-launch`. A configuration written before the
 keyring (no `"secrets"` field) is read the same way and keeps working; run
 `oshirase auth` again to move it into the keyring. `oshirase auth` deletes
 the previous grant's keyring item once the new one is saved.

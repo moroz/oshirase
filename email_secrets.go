@@ -7,10 +7,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
 
+	dbus "github.com/godbus/dbus/v5"
 	"github.com/zalando/go-keyring"
 )
 
@@ -67,11 +70,62 @@ type keyringAPI interface {
 
 type osKeyring struct{}
 
-func (osKeyring) Get(service, user string) (string, error) { return keyring.Get(service, user) }
+func (osKeyring) Get(service, user string) (string, error) {
+	if err := sessionBus(); err != nil {
+		return "", err
+	}
+	return keyring.Get(service, user)
+}
+
 func (osKeyring) Set(service, user, password string) error {
+	if err := sessionBus(); err != nil {
+		return err
+	}
 	return keyring.Set(service, user, password)
 }
-func (osKeyring) Delete(service, user string) error { return keyring.Delete(service, user) }
+
+func (osKeyring) Delete(service, user string) error {
+	if err := sessionBus(); err != nil {
+		return err
+	}
+	return keyring.Delete(service, user)
+}
+
+var errNoSessionBus = errors.New("no D-Bus session bus, so no Secret Service")
+
+func sessionBus() error {
+	return findSessionBus(runtime.GOOS, fmt.Sprintf("/run/user/%d", os.Getuid()))
+}
+
+// findSessionBus checks, where go-keyring uses the Secret Service, that
+// there is a session bus to reach it on, before go-keyring goes looking.
+// godbus (v5.2.2) tries DBUS_SESSION_BUS_ADDRESS, then runUser/bus and
+// runUser/dbus-session, and failing those runs dbus-launch: that starts a
+// stray bus of its own, which may start a new, empty keyring daemon, or
+// fails with "exec: dbus-launch: not found". Neither is an answer worth
+// waiting for. A socket at $XDG_RUNTIME_DIR/bus, which godbus does not
+// look for, is passed on to it through DBUS_SESSION_BUS_ADDRESS.
+func findSessionBus(goos, runUser string) error {
+	if goos == "darwin" || goos == "windows" {
+		return nil
+	}
+	if address := os.Getenv("DBUS_SESSION_BUS_ADDRESS"); address != "" && address != "autolaunch:" {
+		return nil
+	}
+	for _, known := range []string{filepath.Join(runUser, "bus"), filepath.Join(runUser, "dbus-session")} {
+		if _, err := os.Stat(known); err == nil {
+			return nil
+		}
+	}
+	if runtimeDir := os.Getenv("XDG_RUNTIME_DIR"); runtimeDir != "" {
+		socket := filepath.Join(runtimeDir, "bus")
+		if _, err := os.Stat(socket); err == nil {
+			os.Setenv("DBUS_SESSION_BUS_ADDRESS", "unix:path="+dbus.EscapeBusAddressValue(socket))
+			return nil
+		}
+	}
+	return fmt.Errorf("%w (DBUS_SESSION_BUS_ADDRESS is unset, and there is no bus socket in %s or $XDG_RUNTIME_DIR)", errNoSessionBus, runUser)
+}
 
 var (
 	errKeyringTimeout = errors.New("the keyring did not answer")
@@ -209,6 +263,8 @@ func keyringFailure(err error, config *emailConfig) error {
 	auth := "oshirase auth " + config.Provider
 	item := keyringUser(config.GrantID)
 	switch {
+	case errors.Is(err, errNoSessionBus):
+		return fmt.Errorf("%v; run %s -store file", err, auth)
 	case errors.Is(err, keyring.ErrNotFound):
 		return fmt.Errorf("%s has no item %s for this configuration; run %s", keyringName(), item, auth)
 	case errors.Is(err, errKeyringTimeout):
