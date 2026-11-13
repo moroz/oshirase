@@ -288,6 +288,7 @@ type fastmailMetadata struct {
 	RegistrationEndpoint  string   `json:"registration_endpoint"`
 	ScopesSupported       []string `json:"scopes_supported"`
 	CodeChallengeMethods  []string `json:"code_challenge_methods_supported"`
+	IssuerInResponse      bool     `json:"authorization_response_iss_parameter_supported"`
 }
 
 // authFastmail follows the OAuth Profile for Open Public Clients
@@ -321,8 +322,9 @@ func authFastmail(ctx context.Context, issuer, session string, present func(stri
 			"scope":     {scope},
 			"prompt":    {"consent"},
 		},
-		Issuer:  metadata.Issuer,
-		Present: present,
+		Issuer:        metadata.Issuer,
+		RequireIssuer: metadata.IssuerInResponse,
+		Present:       present,
 	})
 	if err != nil {
 		return nil, nil, err

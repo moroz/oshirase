@@ -161,6 +161,11 @@ type authorizeRequest struct {
 	// Issuer, when set, must match an `iss` parameter on the redirect
 	// (RFC 9207); it is how a client tells two authorization servers apart.
 	Issuer string
+	// RequireIssuer refuses a redirect without `iss`: RFC 9207 §2.4 for a
+	// server whose metadata says it sends one
+	// (authorization_response_iss_parameter_supported), so a response
+	// without it is not from that server.
+	RequireIssuer bool
 	// Present shows the URL to the person. The real one prints it; tests
 	// follow it.
 	Present func(authURL string)
@@ -220,9 +225,13 @@ func authorizeLoopback(ctx context.Context, req authorizeRequest) (*authorizatio
 				http.Error(w, "unexpected request", http.StatusBadRequest)
 				return
 			}
-			if req.Issuer != "" && query.Has("iss") && query.Get("iss") != req.Issuer {
+			if req.Issuer != "" && (query.Has("iss") || req.RequireIssuer) && query.Get("iss") != req.Issuer {
 				http.Error(w, "wrong issuer", http.StatusBadRequest)
-				finish(outcome{err: fmt.Errorf("redirect came from issuer %q, expected %q", query.Get("iss"), req.Issuer)})
+				if !query.Has("iss") {
+					finish(outcome{err: fmt.Errorf("the redirect names no issuer, and %s always does", req.Issuer)})
+				} else {
+					finish(outcome{err: fmt.Errorf("redirect came from issuer %q, expected %q", query.Get("iss"), req.Issuer)})
+				}
 				return
 			}
 			if failure := query.Get("error"); failure != "" {

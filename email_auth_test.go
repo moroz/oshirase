@@ -135,6 +135,7 @@ func TestAuthFastmail(t *testing.T) {
 				"registration_endpoint":            issuer + "/oauth/register",
 				"scopes_supported":                 []string{"urn:ietf:params:oauth:scope:mail", "offline_access"},
 				"code_challenge_methods_supported": []string{"S256"},
+				"authorization_response_iss_parameter_supported": true,
 			})
 		case "/oauth/register":
 			json.NewDecoder(r.Body).Decode(&registered)
@@ -187,5 +188,25 @@ func TestReadAPIToken(t *testing.T) {
 	}
 	if _, err := readAPIToken(strings.NewReader("")); err == nil {
 		t.Error("empty input accepted")
+	}
+}
+
+// RFC 9207 §2.4: a server that says it sends iss must send it, so a
+// redirect without one is refused; one that does not say so may omit it.
+func TestIssuerRequiredWhenAdvertised(t *testing.T) {
+	for _, require := range []bool{true, false} {
+		present := followRedirect(t, "", func(url.Values) {}) // no iss
+		_, err := authorizeLoopback(context.Background(), authorizeRequest{
+			Endpoint:      "https://auth.example/authorize",
+			Issuer:        "https://auth.example",
+			RequireIssuer: require,
+			Present:       present,
+		})
+		switch {
+		case require && (err == nil || !strings.Contains(err.Error(), "names no issuer")):
+			t.Errorf("required, no iss: err = %v", err)
+		case !require && err != nil:
+			t.Errorf("not required, no iss: err = %v", err)
+		}
 	}
 }
