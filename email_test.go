@@ -653,6 +653,38 @@ func TestConfigReloadsAfterAuth(t *testing.T) {
 	}
 }
 
+// The configuration directory is tightened to 0700 even when something
+// else created it first, with wider permissions.
+func TestSaveTightensTheDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "oshirase")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "email.json")
+	if err := saveEmailConfig(path, &emailConfig{Provider: providerGoogle}); err != nil {
+		t.Fatal(err)
+	}
+	for name, want := range map[string]os.FileMode{dir: 0o700, path: 0o600} {
+		info, err := os.Stat(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != want {
+			t.Errorf("%s: mode %o, want %o", name, info.Mode().Perm(), want)
+		}
+	}
+
+	// A directory that is not oshirase's own is left alone.
+	other := t.TempDir()
+	os.Chmod(other, 0o755)
+	if err := saveEmailConfig(filepath.Join(other, "email.json"), &emailConfig{}); err != nil {
+		t.Fatal(err)
+	}
+	if info, _ := os.Stat(other); info.Mode().Perm() != 0o755 {
+		t.Errorf("changed %s to %o", other, info.Mode().Perm())
+	}
+}
+
 func TestMissingConfigSaysWhatToRun(t *testing.T) {
 	t.Setenv("OSHIRASE_EMAIL_CONFIG", filepath.Join(t.TempDir(), "none.json"))
 	_, err := selectBackend("email")

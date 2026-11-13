@@ -153,6 +153,15 @@ func saveEmailConfig(path string, config *emailConfig) error {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return err
 	}
+	// MkdirAll leaves an existing directory as it is, and an installer may
+	// have made it 0755 for other files. Tighten it when it is oshirase's
+	// own; a directory named in $OSHIRASE_EMAIL_CONFIG (a home directory,
+	// say) is the person's business, and the file is 0600 regardless.
+	if filepath.Base(dir) == "oshirase" {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return err
+		}
+	}
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
 		return err
