@@ -13,6 +13,14 @@ type Backend interface {
 	Notify(ctx context.Context, n Notification) error
 }
 
+// Withdrawer is a Backend that can take down notifications it has shown.
+// Backends without it answer POST /v1/withdraw with 501.
+type Withdrawer interface {
+	// Withdraw closes every notification shown with the tag that may still
+	// be on screen, and says how many that was.
+	Withdraw(ctx context.Context, tag string) (int, error)
+}
+
 // selectBackend resolves the -backend flag. "auto" is the platform's native
 // backend, defined per OS in backend_<os>.go.
 func selectBackend(name string) (Backend, error) {
@@ -21,6 +29,8 @@ func selectBackend(name string) (Backend, error) {
 		return nativeBackend()
 	case "log":
 		return logBackend{}, nil
+	case "email":
+		return openEmailBackend()
 	default:
 		backend, err := namedNativeBackend(name)
 		if err != nil {
@@ -37,6 +47,11 @@ type logBackend struct{}
 func (logBackend) Name() string { return "log" }
 
 func (logBackend) Notify(_ context.Context, n Notification) error {
-	log.Printf("notification: urgency=%s source=%q title=%q body=%q", n.Urgency, n.Source, n.Title, n.Body)
+	log.Printf("notification: urgency=%s source=%q tag=%q title=%q body=%q", n.Urgency, n.Source, n.Tag, n.Title, n.Body)
 	return nil
+}
+
+func (logBackend) Withdraw(_ context.Context, tag string) (int, error) {
+	log.Printf("withdraw: tag=%q", tag)
+	return 0, nil
 }

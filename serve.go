@@ -22,8 +22,10 @@ const notifyTimeout = 10 * time.Second
 
 func runServe(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
-	listen := flags.String("listen", envOr("OSHIRASE_LISTEN", defaultListen), "address to listen on")
-	backendName := flags.String("backend", "auto", "auto, log, or a platform backend (macos)")
+	listen := flags.String("listen", envOr("OSHIRASE_LISTEN", defaultListen),
+		"address to listen on; several separated by commas, e.g. a VM bridge's besides loopback")
+	backendName := flags.String("backend", envOr("OSHIRASE_BACKEND", "auto"),
+		"auto, log, email, or a platform backend (macos, freedesktop)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -36,32 +38,49 @@ func runServe(args []string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", healthHandler(backend))
 	mux.HandleFunc("POST /v1/notify", notifyHandler(backend))
+	mux.HandleFunc("POST /v1/withdraw", withdrawHandler(backend))
 
 	server := &http.Server{
-		Addr:              *listen,
 		Handler:           rejectBrowsers(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
 		WriteTimeout:      notifyTimeout + 5*time.Second,
 	}
 
+	listeners, err := listenAll(listenAddresses(*listen))
+	if err != nil {
+		return err
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	serveErr := make(chan error, 1)
-	go func() {
-		log.Printf("oshirase %s listening on %s, backend %s", version, *listen, backend.Name())
-		serveErr <- server.ListenAndServe()
-	}()
+	serveErr := make(chan error, len(listeners))
+	for _, listener := range listeners {
+		go func() {
+			log.Printf("oshirase %s listening on %s, backend %s", version, listener.Addr(), backend.Name())
+			serveErr <- server.Serve(listener)
+		}()
+	}
 
-	select {
-	case err := <-serveErr:
-		return err
-	case <-ctx.Done():
-		log.Print("shutting down")
+	shutdown := func() error {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		return server.Shutdown(shutdownCtx)
+	}
+	select {
+	case err := <-serveErr:
+		// One listener failing takes the others down with it.
+		_ = shutdown()
+		return err
+	case <-ctx.Done():
+		// Asked to stop is a clean exit, even when a slow delivery outlasts
+		// the grace period.
+		log.Print("shutting down")
+		if err := shutdown(); err != nil {
+			log.Printf("shutdown: %v", err)
+		}
+		return nil
 	}
 }
 
@@ -91,23 +110,8 @@ func healthHandler(backend Backend) http.HandlerFunc {
 
 func notifyHandler(backend Backend) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Requiring JSON also means a browser could only send this after a
-		// CORS preflight, which the daemon never answers.
-		mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if mediaType != "application/json" {
-			writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
-			return
-		}
-
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 		var notification Notification
-		if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request is over %d bytes", maxRequestSize))
-				return
-			}
-			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		if !decodeJSON(w, r, &notification) {
 			return
 		}
 		if err := notification.Normalize(); err != nil {
@@ -127,6 +131,59 @@ func notifyHandler(backend Backend) http.HandlerFunc {
 		response := NotifyResponse{Delivered: true, Backend: backend.Name()}
 		writeJSON(w, http.StatusOK, response)
 	}
+}
+
+func withdrawHandler(backend Backend) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		withdrawer, ok := backend.(Withdrawer)
+		if !ok {
+			writeError(w, http.StatusNotImplemented, "the "+backend.Name()+" backend cannot withdraw notifications")
+			return
+		}
+		var request WithdrawRequest
+		if !decodeJSON(w, r, &request) {
+			return
+		}
+		if err := NormalizeTag(request.Tag); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), notifyTimeout)
+		defer cancel()
+		count, err := withdrawer.Withdraw(ctx, request.Tag)
+		if err != nil {
+			log.Printf("withdraw failed: tag=%q after %d: %v", request.Tag, count, err)
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if count > 0 {
+			log.Printf("withdrew %d: tag=%q", count, request.Tag)
+		}
+		writeJSON(w, http.StatusOK, WithdrawResponse{Withdrawn: count, Backend: backend.Name()})
+	}
+}
+
+// decodeJSON reads a request body into value, or answers the error itself
+// and returns false. Requiring JSON also means a browser could only send the
+// request after a CORS preflight, which the daemon never answers.
+func decodeJSON(w http.ResponseWriter, r *http.Request, value any) bool {
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
+	if err := json.NewDecoder(r.Body).Decode(value); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request is over %d bytes", maxRequestSize))
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {

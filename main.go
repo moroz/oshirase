@@ -34,6 +34,8 @@ func buildVersion() string {
 const usage = `usage:
   oshirase serve [-listen addr] [-backend name]   run the daemon (host)
   oshirase send [flags] <title> [body]            show a notification (guest)
+  oshirase withdraw -tag <tag> [flags]            take down tagged notifications
+  oshirase auth google|fastmail [flags]           grant the email backend (host)
   oshirase version
 `
 
@@ -54,6 +56,10 @@ func main() {
 		err = runServe(rest)
 	case "send":
 		err = runSend(rest)
+	case "withdraw":
+		err = runWithdraw(rest)
+	case "auth":
+		err = runAuth(rest)
 	case "version":
 		fmt.Println(version)
 	default:

@@ -15,8 +15,17 @@ const (
 	maxTitleRunes  = 256
 	maxBodyRunes   = 4096
 	maxSourceRunes = 64
+	maxTagRunes    = 64
 	maxRequestSize = 64 << 10
 )
+
+// NormalizeTag checks a tag on its own, for POST /v1/withdraw.
+func NormalizeTag(tag string) error {
+	if tag == "" {
+		return errors.New("tag is required")
+	}
+	return (&Notification{Title: "-", Tag: tag}).Normalize()
+}
 
 type Urgency string
 
@@ -36,6 +45,23 @@ type Notification struct {
 	// Source names what sent it ("ssh", "claude-code"); shown where the
 	// platform has room for it.
 	Source string `json:"source,omitempty"`
+	// Tag groups notifications so POST /v1/withdraw can take them down
+	// together once they are out of date, e.g. "ssh-touch" when the key has
+	// been touched.
+	Tag string `json:"tag,omitempty"`
+}
+
+// WithdrawRequest is the body of POST /v1/withdraw.
+type WithdrawRequest struct {
+	Tag string `json:"tag"`
+}
+
+// WithdrawResponse is the body of a successful POST /v1/withdraw: how many
+// notifications with the tag the backend asked to be closed. Some may have
+// been dismissed or have expired already; the platform does not say.
+type WithdrawResponse struct {
+	Withdrawn int    `json:"withdrawn"`
+	Backend   string `json:"backend"`
 }
 
 // NotifyResponse is the body of a successful POST /v1/notify.
@@ -79,6 +105,7 @@ func (n *Notification) Normalize() error {
 		{"title", n.Title, maxTitleRunes},
 		{"body", n.Body, maxBodyRunes},
 		{"source", n.Source, maxSourceRunes},
+		{"tag", n.Tag, maxTagRunes},
 	}
 	for _, field := range fields {
 		if !utf8.ValidString(field.value) {
