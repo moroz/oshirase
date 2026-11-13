@@ -210,3 +210,45 @@ func TestIssuerRequiredWhenAdvertised(t *testing.T) {
 		}
 	}
 }
+
+// The probe in `oshirase auth fastmail` never writes the file, even when it
+// has to refresh: the file still holds the previous configuration, and an
+// incomplete one (no From yet) would replace it. The rotated token is kept
+// in the configuration the caller saves.
+func TestProbeDoesNotSave(t *testing.T) {
+	tokens := &fakeTokenEndpoint{t: t, current: "new-grant", rotate: true}
+	tokenServer := httptest.NewServer(tokens)
+	defer tokenServer.Close()
+	jmap := newFakeJMAP(t, func() string {
+		tokens.mu.Lock()
+		defer tokens.mu.Unlock()
+		if len(tokens.access) == 0 {
+			return "none yet"
+		}
+		return tokens.access[len(tokens.access)-1]
+	})
+
+	path := filepath.Join(t.TempDir(), "email.json")
+	previous := []byte(`{"provider":"google"}` + "\n")
+	os.WriteFile(path, previous, 0o600)
+
+	config := &emailConfig{
+		Provider: providerFastmail, To: "phone@example.com",
+		TokenEndpoint: tokenServer.URL, ClientID: "dyn", RefreshToken: "new-grant",
+		JMAPSession: jmap.server.URL + "/session",
+	}
+	// An access token that counts as expired, so the probe must refresh.
+	access := &tokenResponse{AccessToken: "short-lived", ExpiresIn: 30}
+	if err := resolveFastmailIdentity(context.Background(), path, config, access, nil); err != nil {
+		t.Fatal(err)
+	}
+	if tokens.requests != 1 {
+		t.Fatalf("%d refreshes, want 1", tokens.requests)
+	}
+	if now, _ := os.ReadFile(path); string(now) != string(previous) {
+		t.Errorf("the probe wrote the file: %s", now)
+	}
+	if config.RefreshToken != "new-grant-next" {
+		t.Errorf("config holds %q, not the rotated token", config.RefreshToken)
+	}
+}

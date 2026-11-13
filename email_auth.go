@@ -264,12 +264,19 @@ func readAPIToken(input io.Reader) (string, error) {
 // resolveFastmailIdentity reads the JMAP session with the new credential,
 // checks it may send, and fills in From when it was not given. It uses the
 // backend itself, with the access token the grant just returned (nil for an
-// API token), so the new refresh token is not spent and rotated here.
+// API token), so the new refresh token is normally not spent here. If it is
+// (the access token came back already near expiry), the rotated token
+// lands in config and nowhere else: the file at path is the previous
+// grant's until the caller saves the complete configuration.
 func resolveFastmailIdentity(ctx context.Context, path string, config *emailConfig, access *tokenResponse, httpc *http.Client) error {
-	probe := &emailBackend{path: path, http: httpc, config: config}
+	probe := &emailBackend{path: path, http: httpc, config: config, ephemeral: true}
 	if access != nil {
+		lifetime := time.Duration(access.ExpiresIn) * time.Second
+		if lifetime <= 0 {
+			lifetime = time.Hour // unstated, as in accessToken
+		}
 		probe.access = access.AccessToken
-		probe.expiry = time.Now().Add(time.Duration(access.ExpiresIn) * time.Second)
+		probe.expiry = time.Now().Add(lifetime)
 	}
 	account, err := probe.jmapPrepare(ctx)
 	if err != nil {

@@ -237,6 +237,10 @@ type emailBackend struct {
 	http         *http.Client
 	gmailSendURL string
 	now          func() time.Time // tests replace it
+	// ephemeral keeps a rotated refresh token in config only, never in the
+	// file: for `oshirase auth`, which probes a grant it has not saved yet
+	// and saves the whole configuration itself afterwards.
+	ephemeral bool
 
 	// mu serializes deliveries. Notifications are rare, and serializing
 	// keeps at most one refresh in flight, which Fastmail requires of a
@@ -385,7 +389,10 @@ func (b *emailBackend) refresh(ctx context.Context) (replaced bool, err error) {
 	// Fastmail rotates the refresh token on every use and revokes the grant
 	// if the old one is used again, so the new one has to reach the file
 	// before anything else can go wrong.
-	if token.RefreshToken != "" && token.RefreshToken != b.config.RefreshToken {
+	rotated := token.RefreshToken != "" && token.RefreshToken != b.config.RefreshToken
+	if rotated && b.ephemeral {
+		b.config.RefreshToken = token.RefreshToken
+	} else if rotated {
 		// Unless `oshirase auth` replaced the file during the refresh: its
 		// grant is newer than the one just rotated, and writing ours back
 		// would undo it. Keep the file and drop the old grant from memory.
