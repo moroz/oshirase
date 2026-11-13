@@ -378,6 +378,9 @@ type fastmailMetadata struct {
 	ScopesSupported       []string `json:"scopes_supported"`
 	CodeChallengeMethods  []string `json:"code_challenge_methods_supported"`
 	IssuerInResponse      bool     `json:"authorization_response_iss_parameter_supported"`
+	// ProtectedResources is Fastmail's list of the resources (RFC 8707)
+	// it grants access to; not part of RFC 8414.
+	ProtectedResources []string `json:"protected_resources"`
 }
 
 // authFastmail follows the OAuth Profile for Open Public Clients
@@ -389,6 +392,14 @@ func authFastmail(ctx context.Context, issuer, session string, present func(stri
 	metadata, err := discoverFastmail(ctx, issuer, httpc)
 	if err != nil {
 		return nil, nil, err
+	}
+	// The session URL is the resource the grant is for, so it has to be
+	// spelt exactly as the server lists it (a trailing slash makes it
+	// another resource). Fail here rather than at the browser's redirect
+	// with a bare invalid_target.
+	if len(metadata.ProtectedResources) > 0 && !slices.Contains(metadata.ProtectedResources, session) {
+		return nil, nil, fmt.Errorf("%s is not among the resources %s grants access to (%s); check -session",
+			session, metadata.Issuer, strings.Join(metadata.ProtectedResources, ", "))
 	}
 
 	// The mail scope covers JMAP mail and submission; offline_access is to

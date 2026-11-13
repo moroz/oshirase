@@ -62,6 +62,7 @@ func keyringFastmailSetup(t *testing.T) (*emailBackend, *fakeTokenEndpoint, *fak
 		}
 		return tokens.access[len(tokens.access)-1]
 	})
+	tokens.resource = jmap.server.URL + "/session"
 	config := emailConfig{
 		Provider:      providerFastmail,
 		To:            "phone@example.com",

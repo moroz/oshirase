@@ -615,6 +615,10 @@ func (b *emailBackend) refresh(ctx context.Context) (replaced bool, err error) {
 		ClientSecret:  b.config.ClientSecret,
 		HTTP:          b.http,
 	}
+	if b.config.Provider == providerFastmail {
+		// The grant was made for the JMAP API (RFC 8707); see oauthClient.
+		client.Resource = b.config.JMAPSession
+	}
 	// The refresh and the save of a rotated token run on a context of their
 	// own. The request's context ends when the caller gives up (oshirase
 	// send waits 5 seconds, some callers 3), and a refresh cut off after
@@ -676,6 +680,8 @@ func (b *emailBackend) refreshFailure(err error) error {
 		return fmt.Errorf("%s refused the refresh token for now (%v); try again later", provider, failure)
 	case failure.Code == "invalid_grant":
 		return fmt.Errorf("refresh token revoked or expired (%v); run oshirase auth %s", failure, provider)
+	case failure.Code == "invalid_target":
+		return fmt.Errorf("%s does not accept %q as the API this grant is for (%v); check jmap_session in the configuration, or run oshirase auth %s", provider, b.config.JMAPSession, failure, provider)
 	case failure.Code == "invalid_client" || failure.Code == "unauthorized_client":
 		return fmt.Errorf("%s no longer accepts the OAuth client (%v); run oshirase auth %s", provider, failure, provider)
 	default:

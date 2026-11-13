@@ -36,6 +36,7 @@ type fakeTokenEndpoint struct {
 	failure  string // a JSON error body to answer with, status 400
 	hold     func() // runs before answering, e.g. to make the caller give up
 	rotateTo string // after this answer, accept this refresh token instead
+	resource string // the resource (RFC 8707) a refresh must name; "" for none
 	requests int
 	access   []string // access tokens it has issued
 }
@@ -49,6 +50,9 @@ func (f *fakeTokenEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if got := r.PostForm.Get("client_secret"); got != f.secret {
 		f.t.Errorf("client_secret = %q, want %q", got, f.secret)
+	}
+	if got := r.PostForm.Get("resource"); got != f.resource {
+		f.t.Errorf("resource = %q, want %q", got, f.resource)
 	}
 	if f.hold != nil {
 		f.hold()
@@ -446,6 +450,7 @@ func fastmailSetup(t *testing.T) (*emailBackend, *fakeTokenEndpoint, *fakeJMAP) 
 		}
 		return tokens.access[len(tokens.access)-1]
 	})
+	tokens.resource = jmap.server.URL + "/session"
 	backend := newTestBackend(t, emailConfig{
 		Provider:      providerFastmail,
 		To:            "phone@example.com",
@@ -768,5 +773,17 @@ func TestConfigValidation(t *testing.T) {
 		if config.validate() == nil {
 			t.Errorf("%s: accepted", name)
 		}
+	}
+}
+
+func TestFastmailRefusesTheResource(t *testing.T) {
+	backend, tokens, _ := fastmailSetup(t)
+	tokens.failure = `{"error":"invalid_target"}`
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "check jmap_session") {
+		t.Errorf("err = %v", err)
+	}
+	if backend.config.RefreshToken != secretRefresh {
+		t.Error("a refused refresh changed the stored refresh token")
 	}
 }

@@ -127,7 +127,7 @@ func TestReadGoogleCredentials(t *testing.T) {
 }
 
 func TestAuthFastmail(t *testing.T) {
-	tokenServer := pkceTokenEndpoint(t, "", "https://jmap.example/session", "granted-refresh")
+	tokenServer := pkceTokenEndpoint(t, "", "https://jmap.example/session", "granted-refresh") // the session below
 	var issuer string
 	var registered map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -141,6 +141,7 @@ func TestAuthFastmail(t *testing.T) {
 				"scopes_supported":                 []string{"urn:ietf:params:oauth:scope:mail", "offline_access"},
 				"code_challenge_methods_supported": []string{"S256"},
 				"authorization_response_iss_parameter_supported": true,
+				"protected_resources":                            []string{"https://jmap.example/session", "https://mcp.example"},
 			})
 		case "/oauth/register":
 			json.NewDecoder(r.Body).Decode(&registered)
@@ -153,13 +154,14 @@ func TestAuthFastmail(t *testing.T) {
 	defer server.Close()
 	issuer = server.URL
 
+	const session = "https://jmap.example/session"
 	present := followRedirect(t, issuer, func(query url.Values) {
 		if query.Get("client_id") != "dyn-123" || query.Get("scope") != "urn:ietf:params:oauth:scope:mail offline_access" ||
-			query.Get("resource") != "https://jmap.example/session" {
+			query.Get("resource") != session {
 			t.Errorf("authorization parameters = %v", query)
 		}
 	})
-	config, access, err := authFastmail(context.Background(), issuer, "https://jmap.example/session", present, nil)
+	config, access, err := authFastmail(context.Background(), issuer, session, present, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -233,6 +235,7 @@ func TestProbeDoesNotSave(t *testing.T) {
 		}
 		return tokens.access[len(tokens.access)-1]
 	})
+	tokens.resource = jmap.server.URL + "/session"
 
 	path := filepath.Join(t.TempDir(), "email.json")
 	previous := []byte(`{"provider":"google"}` + "\n")
@@ -386,5 +389,34 @@ func TestStoreGrantReportsALeftoverItem(t *testing.T) {
 	}
 	if !strings.Contains(report.String(), keyringUser(config.GrantID)) || !strings.Contains(report.String(), "Leftover keyring items") {
 		t.Errorf("report = %q", report.String())
+	}
+}
+
+// A session URL the server does not list as a resource fails before the
+// browser is involved, and says which ones it does list.
+func TestAuthFastmailUnlistedSession(t *testing.T) {
+	var issuer string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/.well-known/oauth-authorization-server" {
+			t.Errorf("unexpected request to %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"issuer":                           issuer,
+			"authorization_endpoint":           issuer + "/oauth/authorize",
+			"token_endpoint":                   issuer + "/oauth/refresh",
+			"registration_endpoint":            issuer + "/oauth/register",
+			"code_challenge_methods_supported": []string{"S256"},
+			"protected_resources":              []string{"https://jmap.example/session"},
+		})
+	}))
+	defer server.Close()
+	issuer = server.URL
+
+	present := func(string) { t.Error("the browser was sent to authorize") }
+	_, _, err := authFastmail(context.Background(), issuer, "https://jmap.example/session/", present, nil)
+	if err == nil || !strings.Contains(err.Error(), "check -session") || !strings.Contains(err.Error(), "https://jmap.example/session,") && !strings.Contains(err.Error(), "(https://jmap.example/session)") {
+		t.Errorf("err = %v", err)
 	}
 }

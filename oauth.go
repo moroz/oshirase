@@ -69,9 +69,11 @@ type oauthClient struct {
 	ClientID      string
 	ClientSecret  string
 	// Resource, when set, is the resource indicator (RFC 8707) sent with
-	// the code exchange: the API the token is for. Fastmail refuses a
-	// grant without one (invalid_target). A refresh does without it: the
-	// refresh token is already bound to the resources of its grant.
+	// every token request, the code exchange and each refresh: the API
+	// the token is for. Fastmail refuses an authorization without one
+	// (invalid_target). RFC 8707 does not say what a server does with a
+	// refresh that names none (its §2.2 example names it), so it is sent
+	// there too; naming a resource the grant covers is always allowed.
 	Resource string
 	HTTP     *http.Client
 }
@@ -90,10 +92,14 @@ func (c oauthClient) exchange(ctx context.Context, code, verifier, redirectURI s
 }
 
 func (c oauthClient) refresh(ctx context.Context, refreshToken string) (*tokenResponse, error) {
-	return c.post(ctx, url.Values{
+	form := url.Values{
 		"grant_type":    {"refresh_token"},
 		"refresh_token": {refreshToken},
-	})
+	}
+	if c.Resource != "" {
+		form.Set("resource", c.Resource)
+	}
+	return c.post(ctx, form)
 }
 
 func (c oauthClient) post(ctx context.Context, form url.Values) (*tokenResponse, error) {
