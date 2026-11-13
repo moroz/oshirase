@@ -20,14 +20,21 @@ import (
 )
 
 // `oshirase auth google|fastmail` makes the grant the email backend uses,
-// once, interactively, and writes it to the email configuration file.
+// once, interactively, and stores it: the secrets in the OS keyring (or,
+// with -store file, in email.json), the rest in email.json.
 
 const authUsage = `usage:
   oshirase auth google -credentials client_secret.json -to you@example.com [-from addr]
   oshirase auth google -client-id ID -client-secret SECRET -to you@example.com [-from addr]
   oshirase auth fastmail -to you@example.com [-from addr]
   oshirase auth fastmail -api-token -to you@example.com [-from addr] < token
+
+Every form takes -store keyring (the default) or -store file, and -config path.
 `
+
+// authKeyringTimeout replaces the daemon's 5 seconds: a person is at the
+// terminal, and the keyring may ask them to unlock it.
+const authKeyringTimeout = 2 * time.Minute
 
 // softwareID identifies oshirase to authorization servers that register
 // clients dynamically; it stays the same across versions (RFC 7591 §2).
@@ -40,6 +47,7 @@ func runAuth(args []string) error {
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
+	keyringStore.timeout = authKeyringTimeout
 
 	switch args[0] {
 	case providerGoogle:
@@ -59,11 +67,29 @@ func presentURL(authURL string) {
 	fmt.Fprintf(os.Stderr, "Open this URL in a browser on this machine and allow access:\n\n  %s\n\nWaiting for the redirect (Ctrl-C to give up)...\n", authURL)
 }
 
-func addressFlags(flags *flag.FlagSet) (to, from, configPath *string) {
-	to = flags.String("to", "", "address the notifications go to (required)")
-	from = flags.String("from", "", "address to send as (default: the account's own)")
-	configPath = flags.String("config", "", "configuration file (default $OSHIRASE_EMAIL_CONFIG, else email.json in the user config directory)")
-	return
+// authFlags are the flags every form of auth takes.
+type authFlags struct {
+	to, from, configPath, store *string
+}
+
+func addAuthFlags(flags *flag.FlagSet) authFlags {
+	return authFlags{
+		to:         flags.String("to", "", "address the notifications go to (required)"),
+		from:       flags.String("from", "", "address to send as (default: the account's own)"),
+		configPath: flags.String("config", "", "configuration file (default $OSHIRASE_EMAIL_CONFIG, else email.json in the user config directory)"),
+		store:      flags.String("store", secretsInKeyring, "where the secrets go: keyring (the OS keyring), or file (email.json, mode 0600) where there is no keyring"),
+	}
+}
+
+// check validates the flags and resolves the configuration path.
+func (f authFlags) check() (path string, err error) {
+	if *f.store != secretsInKeyring && *f.store != secretsInFile {
+		return "", fmt.Errorf("-store must be keyring or file, not %q", *f.store)
+	}
+	if err := checkAddresses(*f.to, *f.from); err != nil {
+		return "", err
+	}
+	return resolveConfigPath(*f.configPath)
 }
 
 func checkAddresses(to, from string) error {
@@ -93,14 +119,11 @@ func runAuthGoogle(ctx context.Context, args []string) error {
 	credentials := flags.String("credentials", "", "the client JSON downloaded from Google Cloud (Desktop app client)")
 	clientID := flags.String("client-id", "", "OAuth client id, if not using -credentials")
 	clientSecret := flags.String("client-secret", "", "OAuth client secret, if not using -credentials (shows in ps and shell history; prefer -credentials)")
-	to, from, configFlag := addressFlags(flags)
+	common := addAuthFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if err := checkAddresses(*to, *from); err != nil {
-		return err
-	}
-	path, err := resolveConfigPath(*configFlag)
+	path, err := common.check()
 	if err != nil {
 		return err
 	}
@@ -119,11 +142,11 @@ func runAuthGoogle(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	config.To, config.From = *to, *from
-	if _, err := saveEmailConfig(path, config); err != nil {
+	config.To, config.From = *common.to, *common.from
+	if err := storeGrant(ctx, path, config, *common.store, os.Stderr); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "Saved the grant to %s.\nStart the daemon with: oshirase serve -backend email\n", path)
+	fmt.Fprintf(os.Stderr, "Saved the grant: %s.\nStart the daemon with: oshirase serve -backend email\n", describeStore(path, config))
 	return nil
 }
 
@@ -204,14 +227,11 @@ func runAuthFastmail(ctx context.Context, args []string) error {
 	apiToken := flags.Bool("api-token", false, "read an API token from standard input instead of making an OAuth grant")
 	issuer := flags.String("issuer", fastmailIssuer, "OAuth authorization server")
 	session := flags.String("session", fastmailJMAPSession, "JMAP session URL")
-	to, from, configFlag := addressFlags(flags)
+	common := addAuthFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if err := checkAddresses(*to, *from); err != nil {
-		return err
-	}
-	path, err := resolveConfigPath(*configFlag)
+	path, err := common.check()
 	if err != nil {
 		return err
 	}
@@ -230,18 +250,80 @@ func runAuthFastmail(ctx context.Context, args []string) error {
 			return err
 		}
 	}
-	config.To, config.From = *to, *from
+	config.To, config.From = *common.to, *common.from
 
 	// Find the sending identity now, so a grant that cannot send fails here
 	// rather than at the first notification.
 	if err := resolveFastmailIdentity(ctx, path, config, access, http.DefaultClient); err != nil {
 		return err
 	}
-	if _, err := saveEmailConfig(path, config); err != nil {
+	if err := storeGrant(ctx, path, config, *common.store, os.Stderr); err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "Saved to %s; notifications will be sent as %s to %s.\nStart the daemon with: oshirase serve -backend email\n", path, config.From, config.To)
+	fmt.Fprintf(os.Stderr, "Saved the grant: %s. Notifications will be sent as %s to %s.\nStart the daemon with: oshirase serve -backend email\n", describeStore(path, config), config.From, config.To)
 	return nil
+}
+
+// storeGrant saves a new grant. In the keyring, it writes the new grant's
+// item first, then email.json, so the file never names an item that does
+// not exist; then it deletes the previous grant's item, best effort (a
+// failure is reported, not fatal: the new grant is in place). A grant for
+// -store file goes into email.json whole, and the previous grant's item, if
+// there was one, is deleted as well, so moving between the two leaves
+// nothing behind.
+func storeGrant(ctx context.Context, path string, config *emailConfig, store string, report io.Writer) error {
+	previous := previousGrantID(path)
+
+	switch store {
+	case secretsInKeyring:
+		config.Secrets, config.GrantID = secretsInKeyring, newGrantID()
+		item := keyringUser(config.GrantID)
+		if err := keyringStore.set(ctx, config.GrantID, config.secrets()); err != nil {
+			if errors.Is(err, errKeyringTimeout) || errors.Is(err, context.Canceled) {
+				// A write that timed out or was interrupted may still land.
+				fmt.Fprintf(report, "note: if the keyring item %s appears later, nothing uses it; delete it (see the README, \"Leftover keyring items\")\n", item)
+			}
+			return fmt.Errorf("storing the grant: %w", keyringFailure(err, config))
+		}
+		if _, err := saveEmailConfig(path, config); err != nil {
+			// Undo the item, on a context of its own: ctx may be what ended.
+			undo, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+			defer cancel()
+			if rmErr := keyringStore.remove(undo, config.GrantID); rmErr != nil {
+				fmt.Fprintf(report, "warning: could not delete the keyring item %s after failing to write %s: %v; nothing uses it, delete it by hand (see the README, \"Leftover keyring items\")\n", item, path, rmErr)
+			}
+			return err
+		}
+	case secretsInFile:
+		config.Secrets, config.GrantID = secretsInFile, ""
+		if _, err := saveEmailConfig(path, config); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("unknown store %q", store)
+	}
+
+	if previous != "" && previous != config.GrantID {
+		if err := keyringStore.remove(ctx, previous); err != nil {
+			fmt.Fprintf(report, "warning: could not delete the previous grant's keyring item %s: %v; nothing uses it now, delete it by hand (see the README, \"Leftover keyring items\")\n", keyringUser(previous), err)
+		}
+	}
+	return nil
+}
+
+// previousGrantID is the grant id of the configuration at path, if it is in
+// keyring mode; anything else (no file, a plaintext one, one that does not
+// parse) has no item to delete.
+func previousGrantID(path string) string {
+	grant, _ := fileGrantID(path)
+	return grant
+}
+
+func describeStore(path string, config *emailConfig) string {
+	if config.inKeyring() {
+		return fmt.Sprintf("secrets in %s (item %s), the rest in %s", keyringName(), keyringUser(config.GrantID), path)
+	}
+	return "everything in " + path + " (mode 0600)"
 }
 
 func readAPIToken(input io.Reader) (string, error) {
@@ -269,7 +351,7 @@ func readAPIToken(input io.Reader) (string, error) {
 // lands in config and nowhere else: the file at path is the previous
 // grant's until the caller saves the complete configuration.
 func resolveFastmailIdentity(ctx context.Context, path string, config *emailConfig, access *tokenResponse, httpc *http.Client) error {
-	probe := &emailBackend{path: path, http: httpc, config: config, ephemeral: true}
+	probe := &emailBackend{path: path, http: httpc, config: config, ephemeral: true, keys: keyringStore}
 	if access != nil {
 		lifetime := time.Duration(access.ExpiresIn) * time.Second
 		if lifetime <= 0 {

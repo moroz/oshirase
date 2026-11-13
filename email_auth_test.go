@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/zalando/go-keyring"
 )
 
 // --- The interactive grants, against fake authorization servers
@@ -250,5 +254,135 @@ func TestProbeDoesNotSave(t *testing.T) {
 	}
 	if config.RefreshToken != "new-grant-next" {
 		t.Errorf("config holds %q, not the rotated token", config.RefreshToken)
+	}
+}
+
+// --- Storing the grant
+
+func grantConfig() *emailConfig {
+	return &emailConfig{
+		Provider: providerGoogle, To: "me@example.com",
+		TokenEndpoint: "https://token.example", ClientID: "id",
+		ClientSecret: "client-SECRET", RefreshToken: secretRefresh,
+	}
+}
+
+func TestStoreGrantInTheKeyring(t *testing.T) {
+	freshKeyring(t)
+	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
+	config := grantConfig()
+	var report strings.Builder
+	if err := storeGrant(context.Background(), path, config, secretsInKeyring, &report); err != nil {
+		t.Fatal(err)
+	}
+
+	data, _ := os.ReadFile(path)
+	assertNoSecrets(t, "email.json", string(data))
+	item, ok := keyringItem(t, config.GrantID)
+	if !ok || item.RefreshToken != secretRefresh || item.ClientSecret != "client-SECRET" {
+		t.Errorf("item = %+v, %v", item, ok)
+	}
+
+	// The daemon starts from what auth stored.
+	backend, err := newEmailBackend(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !backend.secretsReady || backend.config.RefreshToken != secretRefresh {
+		t.Errorf("daemon config = %+v", backend.config)
+	}
+
+	// Running auth again replaces the grant and deletes the old item.
+	first := config.GrantID
+	again := grantConfig()
+	again.RefreshToken = "second-SECRET"
+	if err := storeGrant(context.Background(), path, again, secretsInKeyring, &report); err != nil {
+		t.Fatal(err)
+	}
+	if again.GrantID == first {
+		t.Error("the new grant reused the old id")
+	}
+	if _, ok := keyringItem(t, first); ok {
+		t.Error("the previous grant's item is still there")
+	}
+	if report.Len() != 0 {
+		t.Errorf("report = %q", report.String())
+	}
+}
+
+func TestStoreGrantInAFile(t *testing.T) {
+	freshKeyring(t)
+	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
+	// A keyring grant first, then -store file: the old item goes.
+	keyed := grantConfig()
+	storeGrant(context.Background(), path, keyed, secretsInKeyring, io.Discard)
+
+	config := grantConfig()
+	if err := storeGrant(context.Background(), path, config, secretsInFile, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	saved, _, err := loadEmailConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.Secrets != secretsInFile || saved.RefreshToken != secretRefresh || saved.GrantID != "" {
+		t.Errorf("saved = %+v", saved)
+	}
+	if _, ok := keyringItem(t, keyed.GrantID); ok {
+		t.Error("moving to -store file left the keyring item behind")
+	}
+	if info, _ := os.Stat(path); info.Mode().Perm() != 0o600 {
+		t.Errorf("mode %o", info.Mode().Perm())
+	}
+}
+
+// Re-running auth over a plaintext configuration moves it to the keyring.
+func TestStoreGrantMovesALegacyFile(t *testing.T) {
+	freshKeyring(t)
+	path := writeConfig(t, *grantConfig()) // legacy: no "secrets"
+	config := grantConfig()
+	if err := storeGrant(context.Background(), path, config, secretsInKeyring, io.Discard); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(path)
+	assertNoSecrets(t, "email.json", string(data))
+}
+
+// When the keyring refuses, auth says so and how to do without, and leaves
+// the existing configuration alone.
+func TestStoreGrantKeyringFailure(t *testing.T) {
+	freshKeyring(t)
+	path := writeConfig(t, *grantConfig())
+	before, _ := os.ReadFile(path)
+	keyring.MockInitWithError(errors.New("dbus: session bus is not available"))
+
+	err := storeGrant(context.Background(), path, grantConfig(), secretsInKeyring, io.Discard)
+	if err == nil || !strings.Contains(err.Error(), "-store file") || !strings.Contains(err.Error(), "session bus") {
+		t.Errorf("err = %v", err)
+	}
+	if after, _ := os.ReadFile(path); string(after) != string(before) {
+		t.Error("a failed keyring write changed email.json")
+	}
+}
+
+// failingDelete is a keyring whose deletes fail.
+type failingDelete struct{ *gatedKeyring }
+
+func (failingDelete) Delete(string, string) error { return errors.New("delete refused") }
+
+// When the file cannot be written and the new item cannot be removed
+// either, auth names the item left behind.
+func TestStoreGrantReportsALeftoverItem(t *testing.T) {
+	withKeyring(t, failingDelete{newGatedKeyring()}, time.Second)
+	blocker := filepath.Join(t.TempDir(), "not-a-directory")
+	os.WriteFile(blocker, nil, 0o600)
+	config := grantConfig()
+	var report strings.Builder
+	err := storeGrant(context.Background(), filepath.Join(blocker, "email.json"), config, secretsInKeyring, &report)
+	if err == nil {
+		t.Fatal("want the file write to fail")
+	}
+	if !strings.Contains(report.String(), keyringUser(config.GrantID)) || !strings.Contains(report.String(), "Leftover keyring items") {
+		t.Errorf("report = %q", report.String())
 	}
 }

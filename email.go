@@ -26,9 +26,11 @@ const (
 	providerFastmail = "fastmail"
 )
 
-// emailConfig is the file `oshirase auth` writes and the daemon reads. It
-// holds a long-lived credential, so it is written with mode 0600 in a
-// directory with mode 0700.
+// emailConfig is the file `oshirase auth` writes and the daemon reads. The
+// secrets in it (refresh_token, api_token, client_secret) are in the file
+// only when Secrets is "file" or empty; with "keyring" they are in the OS
+// keyring and the daemon fills them in from there. Either way the file is
+// written with mode 0600 in a directory with mode 0700.
 type emailConfig struct {
 	Provider string `json:"provider"` // google or fastmail
 	To       string `json:"to"`
@@ -55,6 +57,12 @@ type emailConfig struct {
 	// MaxPerMinute caps how many emails the daemon sends in any minute: 0
 	// means the default, defaultMaxPerMinute, and -1 means no limit.
 	MaxPerMinute int `json:"max_per_minute,omitempty"`
+
+	// Secrets is where the secrets are: "keyring", "file", or empty for a
+	// configuration from before the keyring (the file). GrantID names the
+	// keyring item; see keyringUser.
+	Secrets string `json:"secrets,omitempty"`
+	GrantID string `json:"grant_id,omitempty"`
 }
 
 // defaultMaxPerMinute keeps whatever can reach the daemon from sending
@@ -69,6 +77,35 @@ func (c *emailConfig) perMinute() int {
 	return c.MaxPerMinute
 }
 
+// validateShape checks what the file says, without the secrets, which in
+// keyring mode are not in it.
+func (c *emailConfig) validateShape() error {
+	switch c.Secrets {
+	case "", secretsInFile:
+	case secretsInKeyring:
+		if c.GrantID == "" {
+			return errors.New(`"secrets": "keyring" needs grant_id`)
+		}
+		if c.secrets() != (emailSecrets{}) {
+			return errors.New(`"secrets" is "keyring" but the file holds secrets too; remove them, or run oshirase auth again`)
+		}
+	default:
+		return fmt.Errorf(`secrets must be "keyring" or "file", not %q`, c.Secrets)
+	}
+	if !c.inKeyring() {
+		return c.validate()
+	}
+	// Stand-ins for the secrets, so the rest is checked as for a file.
+	full := *c
+	if c.Provider == providerFastmail && c.ClientID == "" {
+		full.APIToken = "-"
+	} else {
+		full.RefreshToken, full.ClientSecret = "-", "-"
+	}
+	return full.validate()
+}
+
+// validate checks the configuration with its secrets in place.
 func (c *emailConfig) validate() error {
 	switch c.Provider {
 	case providerGoogle:
@@ -134,17 +171,16 @@ func loadEmailConfig(path string) (*emailConfig, os.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	if info.Mode().Perm()&0o077 != 0 {
-		log.Printf("warning: %s is readable by others (mode %o); it holds a credential, chmod 600 it", path, info.Mode().Perm())
-	}
-
 	var config emailConfig
 	decoder := json.NewDecoder(file)
 	if err := decoder.Decode(&config); err != nil {
 		return nil, nil, fmt.Errorf("reading %s: %w", path, err)
 	}
-	if err := config.validate(); err != nil {
+	if err := config.validateShape(); err != nil {
 		return nil, nil, fmt.Errorf("%s: %w", path, err)
+	}
+	if !config.inKeyring() && info.Mode().Perm()&0o077 != 0 {
+		log.Printf("warning: %s is readable by others (mode %o); it holds a credential, chmod 600 it", path, info.Mode().Perm())
 	}
 	return &config, info, nil
 }
@@ -168,7 +204,11 @@ func saveEmailConfig(path string, config *emailConfig) (os.FileInfo, error) {
 			return nil, err
 		}
 	}
-	data, err := json.MarshalIndent(config, "", "  ")
+	stored := *config
+	if stored.inKeyring() {
+		stored.setSecrets(emailSecrets{}) // never in the file in keyring mode
+	}
+	data, err := json.MarshalIndent(&stored, "", "  ")
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +245,9 @@ func saveEmailConfig(path string, config *emailConfig) (os.FileInfo, error) {
 
 // openEmailBackend is what -backend email selects. Unlike the macOS
 // backend it refuses to start without its configuration: there is nothing
-// it could deliver to, and the error says what to run.
+// it could deliver to, and the error says what to run. A keyring it cannot
+// read is different: that can come right (an unlock), so the daemon starts,
+// logs why, and answers 502 with the same reason until it does.
 func openEmailBackend() (Backend, error) {
 	path, err := emailConfigPath()
 	if err != nil {
@@ -219,13 +261,19 @@ func newEmailBackend(path string) (*emailBackend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &emailBackend{
+	backend := &emailBackend{
 		path:         path,
 		config:       config,
 		loaded:       loaded,
 		http:         &http.Client{},
 		gmailSendURL: gmailSendURL,
-	}, nil
+		secretsReady: !config.inKeyring(),
+		keys:         keyringStore,
+	}
+	if err := backend.ensureSecrets(context.Background()); err != nil {
+		log.Printf("warning: email: %v", err)
+	}
+	return backend, nil
 }
 
 // refreshTimeout bounds a token refresh, which is not cut short when the
@@ -248,14 +296,29 @@ type emailBackend struct {
 	mu     sync.Mutex
 	config *emailConfig
 	loaded os.FileInfo // the file config came from; nil to reload it
-	access string
-	expiry time.Time
-	jmap   *jmapAccount // what the JMAP session said, cached
-	recent []time.Time  // when the sends of the last minute started
+	// secretsReady is false while a keyring-mode config still lacks the
+	// secrets from its keyring item.
+	secretsReady bool
+	// unsaved is a rotated refresh token not yet known to be stored.
+	unsaved *rotation
+	keys    *keyringClient // keyringStore, kept so late writes use the same one
+	// beforeItemWrite, in tests, runs between the check that the file still
+	// names this grant and the keyring write.
+	beforeItemWrite func()
+	access          string
+	expiry          time.Time
+	jmap            *jmapAccount // what the JMAP session said, cached
+	recent          []time.Time  // when the sends of the last minute started
 }
 
 func (b *emailBackend) Name() string { return "email" }
 
+// Notify runs under b.mu, so one slow delivery holds up the next. Its
+// worst case is bounded, not short: reading the keyring item (at most 5 s,
+// and no longer than the request's own 10 s), then a token refresh and the
+// write of a rotated token, which share one uncancellable 15 s; then the
+// send, on what is left of the request's context. About 20 s in all, when
+// a keyring and a token endpoint both hang.
 func (b *emailBackend) Notify(ctx context.Context, n Notification) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -263,6 +326,10 @@ func (b *emailBackend) Notify(ctx context.Context, n Notification) error {
 	if err := b.reloadIfChanged(); err != nil {
 		return err
 	}
+	if err := b.ensureSecrets(ctx); err != nil {
+		return err
+	}
+	b.storeRotated(ctx)
 	if err := b.admit(); err != nil {
 		return err
 	}
@@ -314,10 +381,181 @@ func (b *emailBackend) reloadIfChanged() error {
 	if err != nil {
 		return err
 	}
-	b.config, b.loaded = config, loaded
+	// The same grant, in the keyring: its item can only hold what this
+	// daemon wrote (auth makes a new grant id every time), and the
+	// secrets in memory are at least as new, the unsaved token included. So
+	// keep them rather than read the item, which may still be busy with a
+	// write the daemon gave up on.
+	sameGrant := config.inKeyring() && b.config.inKeyring() && config.GrantID == b.config.GrantID && b.secretsReady
+	if sameGrant {
+		config.setSecrets(b.config.secrets())
+	}
+	b.config, b.loaded, b.secretsReady = config, loaded, sameGrant || !config.inKeyring()
 	b.access, b.expiry, b.jmap = "", time.Time{}, nil
+	if !config.inKeyring() {
+		b.reconcileRotation()
+	} else if !sameGrant {
+		b.unsaved = nil // a new grant; the unsaved token was the old one's
+	}
 	log.Printf("email: reloaded %s (provider %s)", b.path, config.Provider)
 	return nil
+}
+
+// ensureSecrets reads a keyring-mode configuration's secrets from its item,
+// once per load of the file; a failure is retried on the next notification.
+func (b *emailBackend) ensureSecrets(ctx context.Context) error {
+	if b.secretsReady {
+		return nil
+	}
+	secrets, err := b.keys.get(ctx, b.config.GrantID)
+	if err != nil {
+		return keyringFailure(err, b.config)
+	}
+	full := *b.config
+	full.setSecrets(secrets)
+	if err := full.validate(); err != nil {
+		return fmt.Errorf("the keyring item %s: %w; run oshirase auth %s", keyringUser(b.config.GrantID), err, b.config.Provider)
+	}
+	b.config, b.secretsReady = &full, true
+	b.reconcileRotation()
+	return nil
+}
+
+// rotation is a Fastmail refresh token that replaced others and has not
+// been stored yet: its write failed, timed out, or was refused while an
+// earlier one was pending. Losing it loses the grant, since the stored
+// token is spent, so the daemon keeps it until a write of it succeeds.
+type rotation struct {
+	token string
+	spent map[string]bool // the tokens it replaced since the last save
+}
+
+// noteRotation records that token replaced the current one.
+func (b *emailBackend) noteRotation(token string) {
+	if b.unsaved == nil {
+		b.unsaved = &rotation{spent: map[string]bool{}}
+	}
+	b.unsaved.spent[b.config.RefreshToken] = true
+	b.unsaved.token = token
+	b.config.RefreshToken = token
+}
+
+// reconcileRotation runs after a load. A stored token that is one the
+// unsaved token replaced (the file was only touched or edited, or a late
+// write landed an older token) gives way to the unsaved one. Any other
+// token is a new grant, from oshirase auth, and the unsaved token, which
+// belongs to the old grant, is dropped.
+func (b *emailBackend) reconcileRotation() {
+	if b.unsaved == nil {
+		return
+	}
+	switch stored := b.config.RefreshToken; {
+	case stored == b.unsaved.token:
+		b.unsaved = nil // it got there after all
+	case b.unsaved.spent[stored]:
+		b.config.RefreshToken = b.unsaved.token
+	default:
+		b.unsaved = nil
+	}
+}
+
+// storeRotated writes the unsaved token, if there is one, where the loaded
+// configuration keeps its secrets. Notify calls it first thing, so a failed
+// write is retried on the next notification, and so does a keyring write
+// that finishes late: whatever older token that write put in the item,
+// the newest is written after it.
+func (b *emailBackend) storeRotated(ctx context.Context) {
+	if b.unsaved == nil || b.ephemeral {
+		return
+	}
+	// Only into the configuration it belongs to: if the file has changed,
+	// the next load decides (see reconcileRotation).
+	if current, err := os.Stat(b.path); err != nil || !sameVersion(b.loaded, current) {
+		return
+	}
+	saving := b.unsaved.token
+	if b.config.inKeyring() {
+		grant := b.config.GrantID
+		if b.beforeItemWrite != nil {
+			b.beforeItemWrite()
+		}
+		err := b.keys.write(ctx, grant, b.config.secrets(), func() { b.lateWrite(grant) })
+		if err != nil {
+			log.Printf("warning: could not save the rotated refresh token to the keyring: %v; will retry, but the grant is lost if the daemon stops first", keyringFailure(err, b.config))
+			return
+		}
+		b.dropIfSuperseded(ctx, grant)
+	} else {
+		written, err := saveEmailConfig(b.path, b.config)
+		if err != nil {
+			log.Printf("warning: could not save the rotated refresh token to %s: %v; will retry, but the grant is lost if the daemon stops first", b.path, err)
+			return
+		}
+		b.loaded = written
+	}
+	if b.unsaved != nil && b.unsaved.token == saving {
+		b.unsaved = nil
+	}
+}
+
+// lateWrite runs when a keyring write to grant's item, which the daemon
+// gave up on, finishes after all. That write may have put an older token in
+// the item than the newest one, so the newest is written again; or the
+// grant may have been replaced meanwhile, and the write recreated an item
+// auth had deleted.
+func (b *emailBackend) lateWrite(grant string) {
+	go func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
+		defer cancel()
+		if b.dropIfSuperseded(ctx, grant) {
+			return
+		}
+		b.storeRotated(ctx)
+	}()
+}
+
+// dropIfSuperseded deletes grant's item when email.json no longer names
+// it, and says whether it did. Between its check that the file is
+// unchanged and its write, the daemon can recreate an item that oshirase
+// auth has just replaced and deleted; auth deletes the old item only after
+// writing the new file, so checking the file again after the write and
+// deleting the item if it is no longer named leaves none behind, whichever
+// of the two comes last. (A crash in between still can; the README says
+// how to find such items.)
+func (b *emailBackend) dropIfSuperseded(ctx context.Context, grant string) bool {
+	named, ok := fileGrantID(b.path)
+	if !ok || named == grant {
+		return false
+	}
+	if err := b.keys.remove(ctx, grant); err != nil {
+		log.Printf("warning: could not delete %s, the keyring item of a replaced grant: %v; delete it by hand (see the README)", keyringUser(grant), err)
+	} else {
+		log.Printf("email: deleted %s, the keyring item of a replaced grant", keyringUser(grant))
+	}
+	return true
+}
+
+// fileGrantID is the grant the file at path names now: "" with ok for a
+// file that keeps its secrets itself; not ok when it cannot be read, in
+// which case nothing should be deleted on its account.
+func fileGrantID(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var named struct {
+		Secrets string `json:"secrets"`
+		GrantID string `json:"grant_id"`
+	}
+	if json.Unmarshal(data, &named) != nil {
+		return "", false
+	}
+	if named.Secrets != secretsInKeyring {
+		return "", true
+	}
+	return named.GrantID, true
 }
 
 // sameVersion tells whether two stats are of the same write of the file.
@@ -360,6 +598,9 @@ func (b *emailBackend) accessToken(ctx context.Context) (string, error) {
 		if err := b.reloadIfChanged(); err != nil {
 			return "", err
 		}
+		if err := b.ensureSecrets(ctx); err != nil {
+			return "", err
+		}
 	}
 }
 
@@ -387,29 +628,31 @@ func (b *emailBackend) refresh(ctx context.Context) (replaced bool, err error) {
 	}
 
 	// Fastmail rotates the refresh token on every use and revokes the grant
-	// if the old one is used again, so the new one has to reach the file
-	// before anything else can go wrong.
+	// if the old one is used again, so the new one has to be stored before
+	// anything else can go wrong.
 	rotated := token.RefreshToken != "" && token.RefreshToken != b.config.RefreshToken
 	if rotated && b.ephemeral {
 		b.config.RefreshToken = token.RefreshToken
 	} else if rotated {
 		// Unless `oshirase auth` replaced the file during the refresh: its
-		// grant is newer than the one just rotated, and writing ours back
-		// would undo it. Keep the file and drop the old grant from memory.
-		// The check narrows the race to the moment between it and the
-		// rename; closing it would take a lock.
+		// grant is newer than the one just rotated. Keep the file, drop the
+		// old grant from memory, and let the caller load the new one.
+		//
+		// With the secrets in a file this check is what keeps the old grant
+		// from being written over the new one; it narrows that race to the
+		// moment between it and the rename. In the keyring it is not needed
+		// for that: the token goes to the item of the grant this daemon
+		// loaded, keyed by its id, which can never be the new grant's. It
+		// switches to the new grant at once, and mostly saves recreating the
+		// old item after auth deleted it; dropIfSuperseded covers the rest.
 		if current, err := os.Stat(b.path); err != nil || !sameVersion(b.loaded, current) {
 			log.Printf("email: %s changed during a token refresh; keeping the file's grant", b.path)
 			b.loaded, b.access, b.expiry, b.jmap = nil, "", time.Time{}, nil
 			return true, nil
 		}
-		b.config.RefreshToken = token.RefreshToken
-		written, err := saveEmailConfig(b.path, b.config)
-		if err != nil {
-			log.Printf("warning: could not save the rotated refresh token to %s: %v; the grant will be lost when the daemon stops", b.path, err)
-		} else {
-			b.loaded = written
-		}
+		// On refreshCtx, so the refresh and this write share its 15 s.
+		b.noteRotation(token.RefreshToken)
+		b.storeRotated(refreshCtx)
 	}
 
 	lifetime := time.Duration(token.ExpiresIn) * time.Second
