@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -92,12 +93,17 @@ type keyringClient struct {
 	pending bool
 }
 
-// keyringStore is what the daemon and `oshirase auth` use. The daemon's
-// timeout fits inside the 10 seconds a delivery may take; auth raises it,
-// since a person is there to answer a prompt.
+// keyringStore is what the daemon and `oshirase auth` use. The timeout
+// bounds one call; a delivery can make several (a read when the
+// configuration is loaded, a write after a refresh), and each also ends with
+// the context it is given (see emailBackend.Notify for the whole budget).
+// Auth raises the timeout, since a person is there to answer a prompt, and
+// its context ends on Ctrl-C.
 var keyringStore = &keyringClient{api: osKeyring{}, timeout: 5 * time.Second}
 
-func (k *keyringClient) do(call func() error) error {
+// do runs call with the client's timeout, or until ctx ends, whichever is
+// first. Either way a call that has not returned stays pending.
+func (k *keyringClient) do(ctx context.Context, call func() error) error {
 	k.mu.Lock()
 	if k.pending {
 		k.mu.Unlock()
@@ -121,12 +127,14 @@ func (k *keyringClient) do(call func() error) error {
 		return err
 	case <-timer.C:
 		return fmt.Errorf("%w within %s", errKeyringTimeout, k.timeout)
+	case <-ctx.Done():
+		return fmt.Errorf("gave up waiting for the keyring: %w", ctx.Err())
 	}
 }
 
-func (k *keyringClient) get(grantID string) (emailSecrets, error) {
+func (k *keyringClient) get(ctx context.Context, grantID string) (emailSecrets, error) {
 	var value string
-	err := k.do(func() (err error) {
+	err := k.do(ctx, func() (err error) {
 		value, err = k.api.Get(keyringService, keyringUser(grantID))
 		return err
 	})
@@ -141,19 +149,19 @@ func (k *keyringClient) get(grantID string) (emailSecrets, error) {
 	return secrets, nil
 }
 
-func (k *keyringClient) set(grantID string, secrets emailSecrets) error {
+func (k *keyringClient) set(ctx context.Context, grantID string, secrets emailSecrets) error {
 	value, err := json.Marshal(secrets)
 	if err != nil {
 		return err
 	}
-	return k.do(func() error {
+	return k.do(ctx, func() error {
 		return k.api.Set(keyringService, keyringUser(grantID), string(value))
 	})
 }
 
 // remove deletes a grant's item; one already gone is not an error.
-func (k *keyringClient) remove(grantID string) error {
-	err := k.do(func() error {
+func (k *keyringClient) remove(ctx context.Context, grantID string) error {
+	err := k.do(ctx, func() error {
 		return k.api.Delete(keyringService, keyringUser(grantID))
 	})
 	if errors.Is(err, keyring.ErrNotFound) {
@@ -180,6 +188,8 @@ func keyringFailure(err error, config *emailConfig) error {
 		return fmt.Errorf("%s has no item %s for this configuration; run %s", keyringName(), item, auth)
 	case errors.Is(err, errKeyringTimeout):
 		return fmt.Errorf("%v (%s): it is probably locked and waiting at an unlock prompt; unlock it, or run %s -store file", err, keyringName(), auth)
+	case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+		return fmt.Errorf("%s: %v", keyringName(), err)
 	case errors.Is(err, errKeyringBusy):
 		return fmt.Errorf("%s: %v, probably at an unlock prompt; unlock it, or run %s -store file", keyringName(), err, auth)
 	default:

@@ -271,7 +271,7 @@ func TestStoreGrantInTheKeyring(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
 	config := grantConfig()
 	var report strings.Builder
-	if err := storeGrant(path, config, secretsInKeyring, &report); err != nil {
+	if err := storeGrant(context.Background(), path, config, secretsInKeyring, &report); err != nil {
 		t.Fatal(err)
 	}
 
@@ -295,7 +295,7 @@ func TestStoreGrantInTheKeyring(t *testing.T) {
 	first := config.GrantID
 	again := grantConfig()
 	again.RefreshToken = "second-SECRET"
-	if err := storeGrant(path, again, secretsInKeyring, &report); err != nil {
+	if err := storeGrant(context.Background(), path, again, secretsInKeyring, &report); err != nil {
 		t.Fatal(err)
 	}
 	if again.GrantID == first {
@@ -314,10 +314,10 @@ func TestStoreGrantInAFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
 	// A keyring grant first, then -store file: the old item goes.
 	keyed := grantConfig()
-	storeGrant(path, keyed, secretsInKeyring, io.Discard)
+	storeGrant(context.Background(), path, keyed, secretsInKeyring, io.Discard)
 
 	config := grantConfig()
-	if err := storeGrant(path, config, secretsInFile, io.Discard); err != nil {
+	if err := storeGrant(context.Background(), path, config, secretsInFile, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	saved, _, err := loadEmailConfig(path)
@@ -340,7 +340,7 @@ func TestStoreGrantMovesALegacyFile(t *testing.T) {
 	freshKeyring(t)
 	path := writeConfig(t, *grantConfig()) // legacy: no "secrets"
 	config := grantConfig()
-	if err := storeGrant(path, config, secretsInKeyring, io.Discard); err != nil {
+	if err := storeGrant(context.Background(), path, config, secretsInKeyring, io.Discard); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(path)
@@ -355,7 +355,7 @@ func TestStoreGrantKeyringFailure(t *testing.T) {
 	before, _ := os.ReadFile(path)
 	keyring.MockInitWithError(errors.New("dbus: session bus is not available"))
 
-	err := storeGrant(path, grantConfig(), secretsInKeyring, io.Discard)
+	err := storeGrant(context.Background(), path, grantConfig(), secretsInKeyring, io.Discard)
 	if err == nil || !strings.Contains(err.Error(), "-store file") || !strings.Contains(err.Error(), "session bus") {
 		t.Errorf("err = %v", err)
 	}

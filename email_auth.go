@@ -143,7 +143,7 @@ func runAuthGoogle(ctx context.Context, args []string) error {
 		return err
 	}
 	config.To, config.From = *common.to, *common.from
-	if err := storeGrant(path, config, *common.store, os.Stderr); err != nil {
+	if err := storeGrant(ctx, path, config, *common.store, os.Stderr); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Saved the grant: %s.\nStart the daemon with: oshirase serve -backend email\n", describeStore(path, config))
@@ -257,7 +257,7 @@ func runAuthFastmail(ctx context.Context, args []string) error {
 	if err := resolveFastmailIdentity(ctx, path, config, access, http.DefaultClient); err != nil {
 		return err
 	}
-	if err := storeGrant(path, config, *common.store, os.Stderr); err != nil {
+	if err := storeGrant(ctx, path, config, *common.store, os.Stderr); err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "Saved the grant: %s. Notifications will be sent as %s to %s.\nStart the daemon with: oshirase serve -backend email\n", describeStore(path, config), config.From, config.To)
@@ -271,17 +271,17 @@ func runAuthFastmail(ctx context.Context, args []string) error {
 // -store file goes into email.json whole, and the previous grant's item, if
 // there was one, is deleted as well, so moving between the two leaves
 // nothing behind.
-func storeGrant(path string, config *emailConfig, store string, report io.Writer) error {
+func storeGrant(ctx context.Context, path string, config *emailConfig, store string, report io.Writer) error {
 	previous := previousGrantID(path)
 
 	switch store {
 	case secretsInKeyring:
 		config.Secrets, config.GrantID = secretsInKeyring, newGrantID()
-		if err := keyringStore.set(config.GrantID, config.secrets()); err != nil {
+		if err := keyringStore.set(ctx, config.GrantID, config.secrets()); err != nil {
 			return fmt.Errorf("storing the grant: %w", keyringFailure(err, config))
 		}
 		if _, err := saveEmailConfig(path, config); err != nil {
-			keyringStore.remove(config.GrantID)
+			keyringStore.remove(ctx, config.GrantID)
 			return err
 		}
 	case secretsInFile:
@@ -294,7 +294,7 @@ func storeGrant(path string, config *emailConfig, store string, report io.Writer
 	}
 
 	if previous != "" && previous != config.GrantID {
-		if err := keyringStore.remove(previous); err != nil {
+		if err := keyringStore.remove(ctx, previous); err != nil {
 			fmt.Fprintf(report, "warning: could not delete the previous grant's keyring item %s: %v\n", keyringUser(previous), err)
 		}
 	}

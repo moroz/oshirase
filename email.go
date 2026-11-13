@@ -269,7 +269,7 @@ func newEmailBackend(path string) (*emailBackend, error) {
 		gmailSendURL: gmailSendURL,
 		secretsReady: !config.inKeyring(),
 	}
-	if err := backend.ensureSecrets(); err != nil {
+	if err := backend.ensureSecrets(context.Background()); err != nil {
 		log.Printf("warning: email: %v", err)
 	}
 	return backend, nil
@@ -306,6 +306,12 @@ type emailBackend struct {
 
 func (b *emailBackend) Name() string { return "email" }
 
+// Notify runs under b.mu, so one slow delivery holds up the next. Its
+// worst case is bounded, not short: reading the keyring item (at most 5 s,
+// and no longer than the request's own 10 s), then a token refresh and the
+// write of a rotated token, which share one uncancellable 15 s; then the
+// send, on what is left of the request's context. About 20 s in all, when
+// a keyring and a token endpoint both hang.
 func (b *emailBackend) Notify(ctx context.Context, n Notification) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -313,7 +319,7 @@ func (b *emailBackend) Notify(ctx context.Context, n Notification) error {
 	if err := b.reloadIfChanged(); err != nil {
 		return err
 	}
-	if err := b.ensureSecrets(); err != nil {
+	if err := b.ensureSecrets(ctx); err != nil {
 		return err
 	}
 	if err := b.admit(); err != nil {
@@ -375,11 +381,11 @@ func (b *emailBackend) reloadIfChanged() error {
 
 // ensureSecrets reads a keyring-mode configuration's secrets from its item,
 // once per load of the file; a failure is retried on the next notification.
-func (b *emailBackend) ensureSecrets() error {
+func (b *emailBackend) ensureSecrets(ctx context.Context) error {
 	if b.secretsReady {
 		return nil
 	}
-	secrets, err := keyringStore.get(b.config.GrantID)
+	secrets, err := keyringStore.get(ctx, b.config.GrantID)
 	if err != nil {
 		return keyringFailure(err, b.config)
 	}
@@ -432,7 +438,7 @@ func (b *emailBackend) accessToken(ctx context.Context) (string, error) {
 		if err := b.reloadIfChanged(); err != nil {
 			return "", err
 		}
-		if err := b.ensureSecrets(); err != nil {
+		if err := b.ensureSecrets(ctx); err != nil {
 			return "", err
 		}
 	}
@@ -486,7 +492,8 @@ func (b *emailBackend) refresh(ctx context.Context) (replaced bool, err error) {
 		}
 		b.config.RefreshToken = token.RefreshToken
 		if b.config.inKeyring() {
-			if err := keyringStore.set(b.config.GrantID, b.config.secrets()); err != nil {
+			// On refreshCtx, so the refresh and this write share its 15 s.
+			if err := keyringStore.set(refreshCtx, b.config.GrantID, b.config.secrets()); err != nil {
 				log.Printf("warning: could not save the rotated refresh token to the keyring: %v; the grant will be lost when the daemon stops", keyringFailure(err, b.config))
 			}
 		} else {

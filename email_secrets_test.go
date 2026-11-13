@@ -71,7 +71,7 @@ func keyringFastmailSetup(t *testing.T) (*emailBackend, *fakeTokenEndpoint, *fak
 		Secrets:       secretsInKeyring,
 		GrantID:       "grant-a",
 	}
-	if err := keyringStore.set("grant-a", emailSecrets{RefreshToken: secretRefresh}); err != nil {
+	if err := keyringStore.set(context.Background(), "grant-a", emailSecrets{RefreshToken: secretRefresh}); err != nil {
 		t.Fatal(err)
 	}
 	return newTestBackend(t, config), tokens, jmap
@@ -104,7 +104,7 @@ func TestDaemonLoadsSecretsFromTheKeyring(t *testing.T) {
 	gmailServer := httptest.NewServer(gmail)
 	defer gmailServer.Close()
 
-	keyringStore.set("g1", emailSecrets{RefreshToken: secretRefresh, ClientSecret: "client-SECRET"})
+	keyringStore.set(context.Background(), "g1", emailSecrets{RefreshToken: secretRefresh, ClientSecret: "client-SECRET"})
 	backend := newTestBackend(t, emailConfig{
 		Provider: providerGoogle, To: "me@example.com",
 		TokenEndpoint: tokenServer.URL, ClientID: "id",
@@ -147,11 +147,11 @@ func TestStaleGrantCannotClobberANewOne(t *testing.T) {
 	tokens.hold = func() {
 		tokens.hold = nil
 		// What auth does: item first, then the file, then the old item.
-		keyringStore.set("grant-b", emailSecrets{RefreshToken: "fresh-grant-SECRET"})
+		keyringStore.set(context.Background(), "grant-b", emailSecrets{RefreshToken: "fresh-grant-SECRET"})
 		if _, err := saveEmailConfig(backend.path, &newer); err != nil {
 			t.Error(err)
 		}
-		keyringStore.remove("grant-a")
+		keyringStore.remove(context.Background(), "grant-a")
 		tokens.rotateTo = "fresh-grant-SECRET"
 	}
 	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
@@ -242,7 +242,7 @@ func TestLockedKeyringTimesOutInsteadOfHanging(t *testing.T) {
 	config := &emailConfig{Provider: providerFastmail, GrantID: "g1"}
 
 	started := time.Now()
-	_, err := keyringStore.get("g1")
+	_, err := keyringStore.get(context.Background(), "g1")
 	if err == nil || time.Since(started) > 2*time.Second {
 		t.Fatalf("err = %v after %s", err, time.Since(started))
 	}
@@ -251,7 +251,7 @@ func TestLockedKeyringTimesOutInsteadOfHanging(t *testing.T) {
 	}
 
 	// While that call still waits, the next one is refused at once.
-	_, err = keyringStore.get("g1")
+	_, err = keyringStore.get(context.Background(), "g1")
 	if !errors.Is(err, errKeyringBusy) {
 		t.Errorf("second call: err = %v", err)
 	}
@@ -260,13 +260,29 @@ func TestLockedKeyringTimesOutInsteadOfHanging(t *testing.T) {
 	hang.unblock()
 	deadline := time.Now().Add(2 * time.Second)
 	for {
-		if _, err = keyringStore.get("g1"); err == nil || time.Now().After(deadline) {
+		if _, err = keyringStore.get(context.Background(), "g1"); err == nil || time.Now().After(deadline) {
 			break
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	if err != nil {
 		t.Errorf("after the unlock: %v", err)
+	}
+}
+
+// Ctrl-C in `oshirase auth` ends the wait for a keyring prompt at once,
+// not after the two-minute timeout.
+func TestKeyringWaitEndsWithTheContext(t *testing.T) {
+	hang := &hangingKeyring{release: make(chan struct{})}
+	defer hang.unblock()
+	withKeyring(t, hang, time.Hour)
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+
+	started := time.Now()
+	err := keyringStore.set(ctx, "g1", emailSecrets{RefreshToken: "r"})
+	if !errors.Is(err, context.Canceled) || time.Since(started) > 2*time.Second {
+		t.Errorf("err = %v after %s", err, time.Since(started))
 	}
 }
 
