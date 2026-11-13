@@ -31,8 +31,7 @@ type jmapAccount struct {
 	AccountID  string
 	IdentityID string
 	From       string
-	Drafts     string // mailbox ids; Sent may be empty
-	Sent       string
+	Drafts     string // the Drafts mailbox id
 }
 
 func (b *emailBackend) sendJMAP(ctx context.Context, message emailMessage) error {
@@ -56,22 +55,18 @@ func (b *emailBackend) sendJMAP(ctx context.Context, message emailMessage) error
 		draft["header:"+field[0]+":asText"] = field[1]
 	}
 
+	// Once sent, the message is deleted rather than filed in Sent. A copy
+	// of a notification is no use to anyone, and when the recipient
+	// delivers into this same account (an alias or another address of
+	// the owner's domain) a Sent copy shows up as every notification
+	// twice. Whether it does cannot be told from the identities: a
+	// catch-all or an alias need not be one.
 	submit := map[string]any{
 		"accountId": account.AccountID,
 		"create": map[string]any{
 			"send": map[string]string{"identityId": account.IdentityID, "emailId": "#draft"},
 		},
-	}
-	if account.Sent != "" {
-		submit["onSuccessUpdateEmail"] = map[string]any{
-			"#send": map[string]any{
-				"mailboxIds/" + account.Drafts: nil,
-				"mailboxIds/" + account.Sent:   true,
-				"keywords/$draft":              nil,
-			},
-		}
-	} else {
-		submit["onSuccessDestroyEmail"] = []string{"#send"}
+		"onSuccessDestroyEmail": []string{"#send"},
 	}
 
 	responses, err := b.jmapCall(ctx, account.APIURL, []any{
@@ -89,7 +84,7 @@ func (b *emailBackend) sendJMAP(ctx context.Context, message emailMessage) error
 }
 
 // jmapPrepare finds the account, the identity that sends as From, and the
-// Drafts and Sent mailboxes.
+// Drafts mailbox.
 func (b *emailBackend) jmapPrepare(ctx context.Context) (*jmapAccount, error) {
 	if b.jmap != nil {
 		return b.jmap, nil
@@ -114,7 +109,6 @@ func (b *emailBackend) jmapPrepare(ctx context.Context) (*jmapAccount, error) {
 	responses, err := b.jmapCall(ctx, session.APIURL, []any{
 		[]any{"Identity/get", map[string]any{"accountId": accountID}, "0"},
 		[]any{"Mailbox/query", map[string]any{"accountId": accountID, "filter": map[string]string{"role": "drafts"}}, "1"},
-		[]any{"Mailbox/query", map[string]any{"accountId": accountID, "filter": map[string]string{"role": "sent"}}, "2"},
 	})
 	if err != nil {
 		return nil, err
@@ -126,16 +120,13 @@ func (b *emailBackend) jmapPrepare(ctx context.Context) (*jmapAccount, error) {
 			Email string `json:"email"`
 		} `json:"list"`
 	}
-	var drafts, sent struct {
+	var drafts struct {
 		IDs []string `json:"ids"`
 	}
 	if err := responses.decode("0", &identities); err != nil {
 		return nil, err
 	}
 	if err := responses.decode("1", &drafts); err != nil {
-		return nil, err
-	}
-	if err := responses.decode("2", &sent); err != nil {
 		return nil, err
 	}
 
@@ -158,9 +149,6 @@ func (b *emailBackend) jmapPrepare(ctx context.Context) (*jmapAccount, error) {
 		return nil, errors.New("the account has no Drafts mailbox to create the message in")
 	}
 	account.Drafts = drafts.IDs[0]
-	if len(sent.IDs) > 0 {
-		account.Sent = sent.IDs[0]
-	}
 	b.jmap = account
 	return account, nil
 }

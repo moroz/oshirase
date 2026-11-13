@@ -495,9 +495,13 @@ func TestJMAPSendsAndPersistsTheRotatedRefreshToken(t *testing.T) {
 	if created["identityId"] != "id-me" || created["emailId"] != "#draft" {
 		t.Errorf("submission = %v", created)
 	}
-	update := submission["onSuccessUpdateEmail"].(map[string]any)["#send"].(map[string]any)
-	if update["mailboxIds/mb-sent"] != true {
-		t.Errorf("not moved to Sent: %v", update)
+	// Deleted once sent, not filed in Sent: no second copy when the
+	// recipient delivers into the same account.
+	if destroy, _ := submission["onSuccessDestroyEmail"].([]any); len(destroy) != 1 || destroy[0] != "#send" {
+		t.Errorf("onSuccessDestroyEmail = %v", submission["onSuccessDestroyEmail"])
+	}
+	if _, ok := submission["onSuccessUpdateEmail"]; ok {
+		t.Errorf("the sent message is kept: %v", submission["onSuccessUpdateEmail"])
 	}
 
 	// The rotated refresh token is on disk, still private.

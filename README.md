@@ -306,9 +306,12 @@ about once an hour and, for Fastmail, a JMAP session lookup on the first
 notification, then one request to send: a few hundred milliseconds, within
 the 10-second limit on a delivery. After that it is the provider's delivery
 and the phone's push, typically seconds, sometimes a minute. Every
-notification becomes a message — in Sent, and in the recipient's inbox,
-`low` and `normal` ones included — so send to an address whose inbox you
-are willing to fill, or filter on the `[oshirase` subject prefix.
+notification becomes a message in the recipient's inbox, `low` and
+`normal` ones included, so send to an address whose inbox you are willing
+to fill, or filter on the `[oshirase` subject prefix. Gmail also keeps a
+copy in Sent; with Fastmail the daemon deletes its copy once the message
+is sent, so a recipient that delivers into the same account (one of your
+own addresses) gets each notification once, not twice.
 
 ## Protocol (v1)
 
