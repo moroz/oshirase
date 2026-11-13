@@ -245,7 +245,15 @@ func authorizeLoopback(ctx context.Context, req authorizeRequest) (*authorizatio
 		}),
 	}
 	go server.Serve(listener)
-	defer server.Close()
+	// Shutdown, not Close: the handler hands over the code before its
+	// "you can close this tab" page has gone out, and Close would cut that
+	// response off, leaving the browser with a connection error (and a
+	// client that retries the redirect, with "connection refused").
+	defer func() {
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		server.Shutdown(shutdownCtx)
+	}()
 
 	req.Present(authURL)
 
