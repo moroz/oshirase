@@ -68,20 +68,24 @@ installer writes the first time and keeps afterwards:
 - `OSHIRASE_LISTEN`: loopback and every libvirt bridge (`virbr*`) address at
   install time. Set `OSHIRASE_LISTEN` when running the installer to choose
   the addresses yourself (that rewrites the file).
-- `OSHIRASE_BACKEND`: `email` to send mail instead of desktop notifications
-  (see below), `log`, or unset for the desktop. `oshirase auth` must then
-  write the grant where the service looks: the same config directory, or
-  set `OSHIRASE_EMAIL_CONFIG` in this file to the path it used.
+- `OSHIRASE_BACKEND`: `email` to send every notification as mail instead
+  of desktop notifications (see below), `log`, or unset for the desktop.
+  Unset, a notification can still ask to go as an email (`via`).
+- `OSHIRASE_EMAIL_CONFIG`: where the email grant is, when `oshirase auth`
+  wrote it anywhere but the default config directory.
 
 Anything that can connect to the daemon can show notifications and withdraw
-them, and with the email backend send mail as you, so mind where it
-listens. A listener on a specific non-loopback address, such as a bridge's,
-accepts connections only from that address's own network (the guests on
-that bridge) and loopback. Without that, Linux would also take a connection
-for the bridge's address arriving from the LAN, from any machine that routes
-the bridge's subnet through this host. Every guest on the bridge can still
-reach it, not only the VM it is meant for. A wildcard address (`0.0.0.0`)
-is not filtered. Bridge addresses are bound even before the bridge is up.
+them, and, once `oshirase auth` has made a grant on the host, send mail as
+you, whatever the daemon's backend: only to the configured `to` address, and
+at most `max_per_minute` (10) a minute. Delete `email.json` to stop that. So
+mind where it listens. A listener on a specific non-loopback address, such
+as a bridge's, accepts connections only from that address's own network (the
+guests on that bridge) and loopback. Without that, Linux would also take a
+connection for the bridge's address arriving from the LAN, from any machine
+that routes the bridge's subnet through this host. Every guest on the bridge
+can still reach it, not only the VM it is meant for. A wildcard address
+(`0.0.0.0`) is not filtered. Bridge addresses are bound even before the
+bridge is up.
 
 A host firewall usually drops a guest's connections to the host, so allow
 the port on the bridge, e.g. with ufw:
@@ -126,16 +130,32 @@ caller can fall back to something else.
 
 ## Email backend
 
+Once a grant is set up on the host (`oshirase auth`, below), any
+notification can be sent as an email instead of being put on the screen,
+for being reached away from the host:
+
+```sh
+oshirase send -via email -source "oshirase · main" "Release v0.5.0 is out" "Tagged and pushed; the daemon is reinstalled."
+```
+
+The daemon keeps its own backend for everything else, and opens the email
+backend the first time a notification asks for it, so a grant made while
+it runs is used without a restart. Without a grant it answers 501 and
+says to run `oshirase auth`. `oshirase send -via email` waits at least 30
+seconds, and fails if the daemon is older than v0.5.0, which would ignore
+`via` and show the notification on the screen.
+
+To send every notification as an email instead, run the daemon with the
+email backend:
+
 ```sh
 oshirase serve -backend email
 ```
 
-delivers every notification as an email instead of putting it on the
-screen, for being reached away from the host. It works the same on macOS
-and Linux. The subject is the title tagged with the source,
-`[oshirase · ssh] Touch your security key`; the body is the body (or the
-title again, when there is none). `critical` is marked `Importance: high`
-and `X-Priority: 1`, `low` the opposite, so a mail client can sort or
+Both work the same on macOS and Linux. The subject is the title tagged with
+the source, `[oshirase · ssh] Touch your security key`; the body is the body
+(or the title again, when there is none). `critical` is marked `Importance:
+high` and `X-Priority: 1`, `low` the opposite, so a mail client can sort or
 alert on it. If the provider refuses — a revoked grant, an HTTP error — the
 daemon answers 502 with the reason and what to run, e.g. `refresh token
 revoked or expired (invalid_grant: ...); run oshirase auth google`.
@@ -156,10 +176,11 @@ secrets go into the OS keyring (below) and everything else into
 `email.json` is JSON (`provider`, `to`, `from`, `client_id`,
 `token_endpoint`, `jmap_session`, `max_per_minute`, `secrets`, `grant_id`,
 and, in file mode only, `refresh_token`, `api_token` and `client_secret`),
-written with mode 0600 in a 0700 directory. The daemon reloads it when it changes, so
-re-running `oshirase auth` repairs a revoked grant without a restart. The
-daemon refuses to start with `-backend email` and no file. Neither it nor
-`oshirase auth` logs a token or a message body.
+written with mode 0600 in a 0700 directory. The daemon reloads it when it
+changes, so re-running `oshirase auth` repairs a revoked grant without a
+restart. The daemon refuses to start with `-backend email` and no file; with
+another backend it starts anyway, and answers `via: "email"` with 501 until
+there is one. Neither it nor `oshirase auth` logs a token or a message body.
 
 ### Where the secrets are
 
@@ -327,13 +348,15 @@ are ignored.
 | `urgency` | optional | `low`, `normal` (default) or `critical` |
 | `source` | optional | what sent it, e.g. `ssh`; up to 64 characters |
 | `tag` | optional | groups notifications for `POST /v1/withdraw`, e.g. `ssh-touch`; up to 64 characters |
+| `via` | optional | `email` to send this one as an email (v0.5.0); empty for the daemon's own backend. An older daemon ignores it, so check `backend` in the answer |
 
 | Status | Body |
 |---|---|
 | 200 | `{"delivered": true, "backend": "macos"}` |
 | 400, 413, 415 | `{"error": "..."}` — the request is wrong |
 | 403 | the request carried an `Origin` header |
-| 502 | `{"error": "..."}` — the platform refused to show it |
+| 501 | `{"error": "..."}` — `via` asked for email and no grant is set up |
+| 502 | `{"error": "..."}` — the platform or the mail provider refused it |
 
 `POST /v1/withdraw`, `Content-Type: application/json`, `{"tag": "..."}`
 takes down every notification sent with that tag that may still be on
@@ -346,7 +369,10 @@ withdraw (macOS, for now). On Linux, notifications shown before the
 notification server restarted are not closed: their ids may by then belong
 to another application's notifications.
 
-`GET /v1/health` → `{"protocol": 1, "version": "...", "backend": "..."}`.
+`GET /v1/health` → `{"protocol": 1, "version": "...", "backend": "...", "via": ["email"]}`,
+`via` listing what `via` can ask for now (`[]` without an email grant;
+absent before v0.5.0). A withdraw only reaches the daemon's own backend:
+an email cannot be taken back.
 
 Any request with an `Origin` header is refused, and both POST endpoints require a
 JSON content type, so a web page open on the host cannot send notifications
