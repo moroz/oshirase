@@ -59,7 +59,7 @@ func followRedirect(t *testing.T, issuer string, check func(url.Values)) func(st
 
 // pkceTokenEndpoint accepts a code only with the verifier for the
 // challenge that code was issued against.
-func pkceTokenEndpoint(t *testing.T, secret string, rotateTo string) *httptest.Server {
+func pkceTokenEndpoint(t *testing.T, secret, resource, rotateTo string) *httptest.Server {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r.ParseForm()
 		form := r.PostForm
@@ -70,7 +70,8 @@ func pkceTokenEndpoint(t *testing.T, secret string, rotateTo string) *httptest.S
 			io.WriteString(w, `{"error":"invalid_grant","error_description":"PKCE mismatch"}`)
 			return
 		}
-		if form.Get("client_secret") != secret || !strings.HasPrefix(form.Get("redirect_uri"), "http://127.0.0.1:") {
+		if form.Get("client_secret") != secret || form.Get("resource") != resource ||
+			!strings.HasPrefix(form.Get("redirect_uri"), "http://127.0.0.1:") {
 			t.Errorf("token request = %v", form)
 		}
 		json.NewEncoder(w).Encode(map[string]any{
@@ -83,7 +84,7 @@ func pkceTokenEndpoint(t *testing.T, secret string, rotateTo string) *httptest.S
 }
 
 func TestAuthGoogle(t *testing.T) {
-	tokenServer := pkceTokenEndpoint(t, "the-secret", "granted-refresh")
+	tokenServer := pkceTokenEndpoint(t, "the-secret", "", "granted-refresh")
 	present := followRedirect(t, "", func(query url.Values) {
 		if query.Get("client_id") != "the-client" || query.Get("scope") != gmailSendScope ||
 			query.Get("access_type") != "offline" || query.Get("prompt") != "consent" {
@@ -126,7 +127,7 @@ func TestReadGoogleCredentials(t *testing.T) {
 }
 
 func TestAuthFastmail(t *testing.T) {
-	tokenServer := pkceTokenEndpoint(t, "", "granted-refresh")
+	tokenServer := pkceTokenEndpoint(t, "", "https://jmap.example/session", "granted-refresh")
 	var issuer string
 	var registered map[string]any
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -153,7 +154,8 @@ func TestAuthFastmail(t *testing.T) {
 	issuer = server.URL
 
 	present := followRedirect(t, issuer, func(query url.Values) {
-		if query.Get("client_id") != "dyn-123" || query.Get("scope") != "urn:ietf:params:oauth:scope:mail offline_access" {
+		if query.Get("client_id") != "dyn-123" || query.Get("scope") != "urn:ietf:params:oauth:scope:mail offline_access" ||
+			query.Get("resource") != "https://jmap.example/session" {
 			t.Errorf("authorization parameters = %v", query)
 		}
 	})

@@ -410,6 +410,11 @@ func authFastmail(ctx context.Context, issuer, session string, present func(stri
 			"client_id": {clientID},
 			"scope":     {scope},
 			"prompt":    {"consent"},
+			// Fastmail binds each grant to the API it is for (RFC 8707)
+			// and answers invalid_target without one. The JMAP session
+			// URL is that API's resource identifier, as its 401 says
+			// (WWW-Authenticate: Bearer resource_metadata=...).
+			"resource": {session},
 		},
 		Issuer:        metadata.Issuer,
 		RequireIssuer: metadata.IssuerInResponse,
@@ -419,7 +424,7 @@ func authFastmail(ctx context.Context, issuer, session string, present func(stri
 		return nil, nil, err
 	}
 
-	oauth := oauthClient{TokenEndpoint: metadata.TokenEndpoint, ClientID: clientID, HTTP: httpc}
+	oauth := oauthClient{TokenEndpoint: metadata.TokenEndpoint, ClientID: clientID, Resource: session, HTTP: httpc}
 	token, err := oauth.exchange(ctx, grant.Code, grant.Verifier, grant.RedirectURI)
 	if err != nil {
 		return nil, nil, fmt.Errorf("exchanging the code: %w", err)
