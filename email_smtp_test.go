@@ -76,6 +76,7 @@ type fakeSMTP struct {
 	noSTARTTLS bool
 	password   string   // the one it accepts
 	stall      bool     // never greet
+	echoAuth   bool     // quote the credentials back in a refusal
 	commands   []string // verbs, in order
 	logins     []string // username:password, as received
 	plainAuth  bool     // AUTH arrived without TLS
@@ -170,7 +171,7 @@ func (f *fakeSMTP) saw(verb string) bool {
 func (f *fakeSMTP) serve(conn net.Conn) {
 	conn.SetDeadline(time.Now().Add(10 * time.Second))
 	f.mu.Lock()
-	stall, noSTARTTLS, password := f.stall, f.noSTARTTLS, f.password
+	stall, noSTARTTLS, password, echoAuth := f.stall, f.noSTARTTLS, f.password, f.echoAuth
 	f.mu.Unlock()
 	if stall {
 		io.Copy(io.Discard, conn) // until the client gives up
@@ -233,6 +234,8 @@ func (f *fakeSMTP) serve(conn net.Conn) {
 			f.mu.Unlock()
 			if parts[2] == password {
 				reply("235 2.7.0 ok")
+			} else if echoAuth {
+				reply("535 5.7.8 Rejected %s for %s (%s)", initial, parts[1], parts[2])
 			} else {
 				reply("535 5.7.8 Authentication failed for %s", parts[1])
 			}
@@ -540,4 +543,20 @@ func TestSMTPBodyWithLeadingDot(t *testing.T) {
 	if !strings.Contains(string(body), "one\n.\ntwo") {
 		t.Errorf("body = %q", body)
 	}
+}
+
+// A server that quotes the credentials back in its refusal, base64 or
+// plain, does not get the password into the error.
+func TestSMTPRefusalQuotingThePasswordIsRedacted(t *testing.T) {
+	backend, server := smtpSetup(t, true, "127.0.0.1:465")
+	server.set(func(f *fakeSMTP) { f.password, f.echoAuth = "another", true })
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "refused the password") {
+		t.Fatalf("err = %v", err)
+	}
+	encoded := base64.StdEncoding.EncodeToString([]byte("\x00me@fastmail.com\x00" + secretSMTPPassword))
+	if strings.Contains(err.Error(), encoded) || !strings.Contains(err.Error(), "[password]") {
+		t.Errorf("err = %v", err)
+	}
+	assertNoSecrets(t, "error", err.Error())
 }

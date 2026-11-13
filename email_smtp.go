@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -139,7 +140,7 @@ func (t smtpTransport) session(ctx context.Context, account smtpAccount, then fu
 		return fmt.Errorf("smtp_host: %w", checkSMTPHost(account.Host))
 	}
 	fail := func(stage string, err error) error {
-		return smtpFailure(ctx, account.Host, stage, err)
+		return account.redact(smtpFailure(ctx, account.Host, stage, err))
 	}
 
 	dial := t.dial
@@ -200,6 +201,27 @@ func (t smtpTransport) session(ctx context.Context, account smtpAccount, then fu
 		return fail("QUIT", err)
 	}
 	return nil
+}
+
+// redact takes the password out of err, in case the server quoted it back:
+// a reply to a malformed AUTH can repeat the base64 it was given. The
+// stage and host stay; only the error's text changes.
+func (a smtpAccount) redact(err error) error {
+	if err == nil || a.Password == "" {
+		return err
+	}
+	text := err.Error()
+	for _, secret := range []string{
+		base64.StdEncoding.EncodeToString([]byte("\x00" + a.Username + "\x00" + a.Password)),
+		base64.StdEncoding.EncodeToString([]byte(a.Password)),
+		a.Password,
+	} {
+		text = strings.ReplaceAll(text, secret, "[password]")
+	}
+	if text == err.Error() {
+		return err
+	}
+	return errors.New(text)
 }
 
 // smtpFailure turns what went wrong at stage into what the person can do
