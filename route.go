@@ -38,12 +38,16 @@ func newRouter(primary Backend) *router {
 	}
 }
 
+// pick returns the backend for a notification's Via. Its error wraps
+// errNoEmailConfig when email was asked for and no grant exists.
 func (r *router) pick(via string) (Backend, error) {
-	if via == "" || via == r.primary.Name() {
+	switch {
+	case via == "":
 		return r.primary, nil
-	}
-	if via != ViaEmail {
-		return nil, fmt.Errorf("cannot deliver via %q", via)
+	case via != ViaEmail:
+		return nil, fmt.Errorf("cannot deliver via %q", via) // Normalize already refuses it
+	case r.primary.Name() == ViaEmail:
+		return r.primary, nil // never a second email backend
 	}
 
 	r.mu.Lock()
@@ -53,14 +57,15 @@ func (r *router) pick(via string) (Backend, error) {
 		// running oshirase auth fixes it without a restart.
 		backend, err := r.openEmail()
 		if err != nil {
-			return nil, fmt.Errorf("email is not set up on this host (%v); run oshirase auth there", err)
+			return nil, fmt.Errorf("opening the email backend: %w", err)
 		}
 		r.email = backend
 	}
 	return r.email, nil
 }
 
-// available lists the Via values that can be delivered now.
+// available lists the Via values there is a grant for. It only looks for
+// the configuration file, so a broken one is listed and fails when used.
 func (r *router) available() []string {
 	if r.primary.Name() == ViaEmail || r.emailSetUp() {
 		return []string{ViaEmail}

@@ -45,7 +45,10 @@ func runServe(args []string) error {
 		Handler:           rejectBrowsers(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
-		WriteTimeout:      notifyTimeout + 5*time.Second,
+		// Room for the slowest delivery, an email's: opening the backend
+		// on first use (a keyring read, up to 5 s), then a delivery whose
+		// token refresh may outlast notifyTimeout (see emailBackend.Notify).
+		WriteTimeout: emailSendTimeout + 5*time.Second,
 	}
 
 	listeners, err := listenAll(listenAddresses(*listen))
@@ -123,7 +126,12 @@ func notifyHandler(routes *router) http.HandlerFunc {
 		backend, err := routes.pick(notification.Via)
 		if err != nil {
 			log.Printf("cannot deliver via %s: %v", notification.Via, err)
-			writeError(w, http.StatusNotImplemented, err.Error())
+			if errors.Is(err, errNoEmailConfig) {
+				// Without the host's path: the guest asking has no use for it.
+				writeError(w, http.StatusNotImplemented, "email is not set up on this host; run oshirase auth there")
+			} else {
+				writeError(w, http.StatusBadGateway, err.Error())
+			}
 			return
 		}
 

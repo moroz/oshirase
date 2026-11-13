@@ -64,9 +64,12 @@ func runSend(args []string) error {
 	return checkDeliveredVia(notification.Via, body)
 }
 
-// emailSendTimeout is the least time send waits for an email: the
-// daemon's own limit on one delivery, and a little more.
-const emailSendTimeout = notifyTimeout + 5*time.Second
+// emailSendTimeout is the least time send waits for an email. Its worst
+// case is about 25 s: opening the email backend on first use (a keyring
+// read, 5 s), the keyring again in Notify (5 s), a token refresh and the
+// write of a rotated token (15 s, not cut short by notifyTimeout), then
+// the send.
+const emailSendTimeout = 30 * time.Second
 
 // checkDeliveredVia catches a daemon older than Via, which ignores the
 // field and shows the notification on the screen instead.

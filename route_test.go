@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -69,12 +70,13 @@ func TestViaEmailWithoutAGrant(t *testing.T) {
 	fail := true
 	routes.openEmail = func() (Backend, error) {
 		if fail {
-			return nil, errors.New("open email.json: no such file or directory")
+			return nil, fmt.Errorf("%w at /home/someone/.config/oshirase/email.json", errNoEmailConfig)
 		}
 		return &recordingBackend{name: "email"}, nil
 	}
 	got := notify(t, routes, `{"title":"x","via":"email"}`)
-	if got.Code != http.StatusNotImplemented || !strings.Contains(got.Body.String(), "run oshirase auth") {
+	if got.Code != http.StatusNotImplemented || !strings.Contains(got.Body.String(), "run oshirase auth") ||
+		strings.Contains(got.Body.String(), "/home/") {
 		t.Errorf("got %d %s", got.Code, got.Body)
 	}
 	// A grant made after the daemon started is used without a restart.
@@ -127,5 +129,62 @@ func TestSendNoticesAnOldDaemon(t *testing.T) {
 	}
 	if err := checkDeliveredVia("", []byte(`{"delivered":true,"backend":"freedesktop"}`)); err != nil {
 		t.Error(err)
+	}
+}
+
+// A configuration that exists but cannot be used is not "not set up": its
+// own error goes back, as a failure to deliver.
+func TestViaEmailBrokenConfig(t *testing.T) {
+	routes := newRouter(&recordingBackend{name: "freedesktop"})
+	routes.openEmail = func() (Backend, error) {
+		return nil, errors.New("reading email.json: invalid character 'x'")
+	}
+	got := notify(t, routes, `{"title":"x","via":"email"}`)
+	if got.Code != http.StatusBadGateway || !strings.Contains(got.Body.String(), "invalid character") {
+		t.Errorf("got %d %s", got.Code, got.Body)
+	}
+}
+
+// Requests for email that arrive together open one backend between them,
+// and a notification for the screen does not wait for the opening.
+func TestViaEmailOpensOnceAndDoesNotHoldUpTheScreen(t *testing.T) {
+	screen := &recordingBackend{name: "freedesktop"}
+	routes := newRouter(screen)
+	release := make(chan struct{})
+	started := make(chan struct{}, 5)
+	var mu sync.Mutex
+	opened := 0
+	routes.openEmail = func() (Backend, error) {
+		mu.Lock()
+		opened++
+		mu.Unlock()
+		started <- struct{}{}
+		<-release // a slow keyring
+		return &recordingBackend{name: "email"}, nil
+	}
+
+	var wg sync.WaitGroup
+	codes := make(chan int, 5)
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- notify(t, routes, `{"title":"x","via":"email"}`).Code
+		}()
+	}
+	<-started // an opening is under way, holding the router's lock
+	if got := notify(t, routes, `{"title":"screen"}`); got.Code != http.StatusOK || len(screen.got) != 1 {
+		t.Errorf("the screen notification: %d %s", got.Code, got.Body)
+	}
+	close(release)
+	wg.Wait()
+	close(codes)
+	for code := range codes {
+		if code != http.StatusOK {
+			t.Errorf("an email request got %d", code)
+		}
+	}
+	if opened != 1 {
+		t.Errorf("opened %d email backends, want 1", opened)
 	}
 }

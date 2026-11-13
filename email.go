@@ -157,10 +157,14 @@ func emailConfigPath() (string, error) {
 // loadEmailConfig also returns what the file was when read: the stat of
 // the open file, so it describes the content decoded and not whatever
 // replaced it a moment later.
+// errNoEmailConfig is the email configuration file not existing: no grant
+// has been made on this host.
+var errNoEmailConfig = errors.New("no email configuration")
+
 func loadEmailConfig(path string) (*emailConfig, os.FileInfo, error) {
 	file, err := os.Open(path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return nil, nil, fmt.Errorf("no email configuration at %s; run oshirase auth google or oshirase auth fastmail", path)
+		return nil, nil, fmt.Errorf("%w at %s; run oshirase auth google or oshirase auth fastmail", errNoEmailConfig, path)
 	}
 	if err != nil {
 		return nil, nil, err
