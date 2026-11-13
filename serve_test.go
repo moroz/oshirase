@@ -54,3 +54,10 @@ func TestListenAddresses(t *testing.T) {
 		t.Errorf("listenAddresses() = %q, want %q", got, want)
 	}
 }
+
+func TestWithdrawTooLarge(t *testing.T) {
+	body := `{"tag":"` + strings.Repeat("x", maxRequestSize) + `"}`
+	if got := withdrawRequest(t, logBackend{}, "application/json", body); got.Code != http.StatusRequestEntityTooLarge {
+		t.Errorf("got %d %s, want 413", got.Code, got.Body)
+	}
+}

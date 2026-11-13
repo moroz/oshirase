@@ -8,11 +8,9 @@ import (
 	"fmt"
 	"log"
 	"mime"
-	"net"
 	"net/http"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 )
@@ -48,9 +46,6 @@ func runServe(args []string) error {
 		WriteTimeout:      notifyTimeout + 5*time.Second,
 	}
 
-	// Bind every address before serving any, so a daemon that cannot have
-	// all of them fails at once (and its supervisor retries) rather than
-	// running half-reachable.
 	listeners, err := listenAll(listenAddresses(*listen))
 	if err != nil {
 		return err
@@ -78,38 +73,14 @@ func runServe(args []string) error {
 		_ = shutdown()
 		return err
 	case <-ctx.Done():
+		// Asked to stop is a clean exit, even when a slow delivery outlasts
+		// the grace period.
 		log.Print("shutting down")
-		return shutdown()
-	}
-}
-
-// listenAddresses splits a comma-separated -listen value, dropping blanks.
-func listenAddresses(value string) []string {
-	var addresses []string
-	for _, address := range strings.Split(value, ",") {
-		if address = strings.TrimSpace(address); address != "" {
-			addresses = append(addresses, address)
+		if err := shutdown(); err != nil {
+			log.Printf("shutdown: %v", err)
 		}
+		return nil
 	}
-	return addresses
-}
-
-func listenAll(addresses []string) ([]net.Listener, error) {
-	if len(addresses) == 0 {
-		return nil, errors.New("no address to listen on")
-	}
-	var listeners []net.Listener
-	for _, address := range addresses {
-		listener, err := net.Listen("tcp", address)
-		if err != nil {
-			for _, open := range listeners {
-				open.Close()
-			}
-			return nil, err
-		}
-		listeners = append(listeners, listener)
-	}
-	return listeners, nil
 }
 
 // rejectBrowsers turns away anything a web page could send. A page on the
@@ -138,23 +109,8 @@ func healthHandler(backend Backend) http.HandlerFunc {
 
 func notifyHandler(backend Backend) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// Requiring JSON also means a browser could only send this after a
-		// CORS preflight, which the daemon never answers.
-		mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if mediaType != "application/json" {
-			writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
-			return
-		}
-
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 		var notification Notification
-		if err := json.NewDecoder(r.Body).Decode(&notification); err != nil {
-			var tooLarge *http.MaxBytesError
-			if errors.As(err, &tooLarge) {
-				writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request is over %d bytes", maxRequestSize))
-				return
-			}
-			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		if !decodeJSON(w, r, &notification) {
 			return
 		}
 		if err := notification.Normalize(); err != nil {
@@ -183,16 +139,8 @@ func withdrawHandler(backend Backend) http.HandlerFunc {
 			writeError(w, http.StatusNotImplemented, "the "+backend.Name()+" backend cannot withdraw notifications")
 			return
 		}
-		mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-		if mediaType != "application/json" {
-			writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
-			return
-		}
-
-		r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
 		var request WithdrawRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		if !decodeJSON(w, r, &request) {
 			return
 		}
 		if err := NormalizeTag(request.Tag); err != nil {
@@ -213,6 +161,28 @@ func withdrawHandler(backend Backend) http.HandlerFunc {
 		}
 		writeJSON(w, http.StatusOK, WithdrawResponse{Withdrawn: count, Backend: backend.Name()})
 	}
+}
+
+// decodeJSON reads a request body into value, or answers the error itself
+// and returns false. Requiring JSON also means a browser could only send the
+// request after a CORS preflight, which the daemon never answers.
+func decodeJSON(w http.ResponseWriter, r *http.Request, value any) bool {
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+		return false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
+	if err := json.NewDecoder(r.Body).Decode(value); err != nil {
+		var tooLarge *http.MaxBytesError
+		if errors.As(err, &tooLarge) {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request is over %d bytes", maxRequestSize))
+			return false
+		}
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return false
+	}
+	return true
 }
 
 func writeJSON(w http.ResponseWriter, status int, value any) {
