@@ -57,7 +57,8 @@ type WithdrawRequest struct {
 }
 
 // WithdrawResponse is the body of a successful POST /v1/withdraw: how many
-// notifications with the tag were still being shown.
+// notifications with the tag the backend asked to be closed. Some may have
+// been dismissed or have expired already; the platform does not say.
 type WithdrawResponse struct {
 	Withdrawn int    `json:"withdrawn"`
 	Backend   string `json:"backend"`

@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 )
 
 // The freedesktop.org notification service: what GNOME, Cinnamon, KDE, MATE,
@@ -32,7 +33,11 @@ func nativeBackend() (Backend, error) {
 		log.Printf("warning: busctl not found (it comes with systemd): %v", err)
 		path = "busctl"
 	}
-	return &freedesktopBackend{busctl: path, shown: map[string][]uint32{}}, nil
+	return newFreedesktopBackend(path), nil
+}
+
+func newFreedesktopBackend(busctl string) *freedesktopBackend {
+	return &freedesktopBackend{busctl: busctl, shown: map[string][]shownID{}, withdrawn: map[string]time.Time{}}
 }
 
 func namedNativeBackend(name string) (Backend, error) {
@@ -53,7 +58,20 @@ type freedesktopBackend struct {
 	// shown holds the server's ids of the tagged notifications not yet
 	// withdrawn, for Withdraw. Some may have been dismissed by hand since;
 	// closing those again is harmless.
-	shown map[string][]uint32
+	shown map[string][]shownID
+	// withdrawn is when each tag was last withdrawn, so a notification
+	// whose Notify was still under way at that moment is closed as soon as
+	// its id is known, rather than left up.
+	withdrawn map[string]time.Time
+}
+
+// shownID is a notification id with the server that issued it: its unique
+// bus name. Ids are only unique within one run of a server, and a server
+// does not check which application an id belongs to, so after a restart an
+// old id could close another application's notification.
+type shownID struct {
+	id    uint32
+	owner string
 }
 
 // Withdrawn or not, a tag keeps at most this many ids, so a tag nobody ever
@@ -63,6 +81,7 @@ const maxShownPerTag = 32
 func (*freedesktopBackend) Name() string { return "freedesktop" }
 
 func (b *freedesktopBackend) Notify(ctx context.Context, n Notification) error {
+	started := time.Now()
 	caps, err := b.capabilities(ctx)
 	if err != nil {
 		return err
@@ -92,8 +111,23 @@ func (b *freedesktopBackend) Notify(ctx context.Context, n Notification) error {
 		log.Printf("warning: no notification id in the reply to Notify: %s", strings.TrimSpace(string(output)))
 		return nil
 	}
+	// After Notify, which starts a D-Bus-activated server that was not
+	// running.
+	owner, err := b.serverOwner(ctx)
+	if err != nil {
+		log.Printf("warning: cannot tell which server showed notification %d, so it cannot be withdrawn: %v", reply.Data[0], err)
+		return nil
+	}
+	shown := shownID{id: reply.Data[0], owner: owner}
+
 	b.mu.Lock()
-	ids := append(b.shown[n.Tag], reply.Data[0])
+	if b.withdrawn[n.Tag].After(started) {
+		// Withdrawn while it was being shown.
+		b.mu.Unlock()
+		b.close(ctx, shown)
+		return nil
+	}
+	ids := append(b.shown[n.Tag], shown)
 	if len(ids) > maxShownPerTag {
 		ids = ids[len(ids)-maxShownPerTag:]
 	}
@@ -102,24 +136,62 @@ func (b *freedesktopBackend) Notify(ctx context.Context, n Notification) error {
 	return nil
 }
 
-// Withdraw closes the tag's notifications. An id the server no longer knows
-// (dismissed, or expired) is not an error to CloseNotification.
+// Withdraw closes the tag's notifications that the running server showed,
+// and counts them. Some may already have been dismissed or expired; an id the
+// server no longer knows is not an error to CloseNotification. Ids from an
+// earlier run of the server are dropped unclosed.
 func (b *freedesktopBackend) Withdraw(ctx context.Context, tag string) (int, error) {
 	b.mu.Lock()
+	b.withdrawn[tag] = time.Now()
 	ids := b.shown[tag]
 	delete(b.shown, tag)
 	b.mu.Unlock()
+	if len(ids) == 0 {
+		return 0, nil
+	}
 
-	for i, id := range ids {
-		if _, err := b.call(ctx, "CloseNotification", "u", fmt.Sprint(id)); err != nil {
+	owner, err := b.serverOwner(ctx)
+	if err != nil {
+		// No server, so nothing of ours is on screen.
+		return 0, nil
+	}
+	closed := 0
+	for i, shown := range ids {
+		if shown.owner != owner {
+			continue
+		}
+		if err := b.close(ctx, shown); err != nil {
 			// Keep what was not closed, so a retry can.
 			b.mu.Lock()
 			b.shown[tag] = append(ids[i:], b.shown[tag]...)
 			b.mu.Unlock()
-			return i, err
+			return closed, err
 		}
+		closed++
 	}
-	return len(ids), nil
+	return closed, nil
+}
+
+func (b *freedesktopBackend) close(ctx context.Context, shown shownID) error {
+	_, err := b.call(ctx, "CloseNotification", "u", fmt.Sprint(shown.id))
+	return err
+}
+
+// serverOwner is the unique bus name of the process providing the
+// notification service now, which changes when it restarts.
+func (b *freedesktopBackend) serverOwner(ctx context.Context) (string, error) {
+	output, err := b.callBus(ctx, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+		"GetNameOwner", "s", notificationsName)
+	if err != nil {
+		return "", err
+	}
+	var reply struct {
+		Data []string `json:"data"`
+	}
+	if err := json.Unmarshal(output, &reply); err != nil || len(reply.Data) != 1 || reply.Data[0] == "" {
+		return "", fmt.Errorf("unexpected GetNameOwner reply: %s", strings.TrimSpace(string(output)))
+	}
+	return reply.Data[0], nil
 }
 
 // capabilities asks the server what it supports. Only body-markup matters:
@@ -142,12 +214,16 @@ func (b *freedesktopBackend) capabilities(ctx context.Context) (map[string]bool,
 	return caps, nil
 }
 
+// call calls a method of the notification service.
 func (b *freedesktopBackend) call(ctx context.Context, method ...string) ([]byte, error) {
+	return b.callBus(ctx, notificationsName, notificationsPath, notificationsIface, method...)
+}
+
+func (b *freedesktopBackend) callBus(ctx context.Context, name, path, iface string, method ...string) ([]byte, error) {
 	// "--" ends busctl's options, so a title or body starting with "-" is
 	// passed as text. The text travels as separate arguments; nothing runs
 	// through a shell.
-	args := append([]string{"--user", "--json=short", "--",
-		"call", notificationsName, notificationsPath, notificationsIface}, method...)
+	args := append([]string{"--user", "--json=short", "--", "call", name, path, iface}, method...)
 	cmd := exec.CommandContext(ctx, b.busctl, args...)
 	var stderr strings.Builder
 	cmd.Stderr = &stderr

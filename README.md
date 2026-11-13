@@ -249,8 +249,12 @@ are ignored.
 takes down every notification sent with that tag that may still be on
 screen, e.g. a "touch your key" notice once the key has been touched
 (`oshirase withdraw -tag ssh-touch`). It answers
-`{"withdrawn": 2, "backend": "freedesktop"}`, counting what it closed, or
-501 from a backend that cannot withdraw (macOS, for now).
+`{"withdrawn": 2, "backend": "freedesktop"}`, counting the notifications it
+asked the platform to close (some may already have been dismissed or have
+expired; the platform does not say), or 501 from a backend that cannot
+withdraw (macOS, for now). On Linux, notifications shown before the
+notification server restarted are not closed: their ids may by then belong
+to another application's notifications.
 
 `GET /v1/health` → `{"protocol": 1, "version": "...", "backend": "..."}`.
 
