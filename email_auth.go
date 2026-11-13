@@ -305,18 +305,8 @@ func storeGrant(ctx context.Context, path string, config *emailConfig, store str
 // keyring mode; anything else (no file, a plaintext one, one that does not
 // parse) has no item to delete.
 func previousGrantID(path string) string {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return ""
-	}
-	var previous struct {
-		Secrets string `json:"secrets"`
-		GrantID string `json:"grant_id"`
-	}
-	if json.Unmarshal(data, &previous) != nil || previous.Secrets != secretsInKeyring {
-		return ""
-	}
-	return previous.GrantID
+	grant, _ := fileGrantID(path)
+	return grant
 }
 
 func describeStore(path string, config *emailConfig) string {

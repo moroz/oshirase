@@ -302,10 +302,13 @@ type emailBackend struct {
 	// unsaved is a rotated refresh token not yet known to be stored.
 	unsaved *rotation
 	keys    *keyringClient // keyringStore, kept so late writes use the same one
-	access  string
-	expiry  time.Time
-	jmap    *jmapAccount // what the JMAP session said, cached
-	recent  []time.Time  // when the sends of the last minute started
+	// beforeItemWrite, in tests, runs between the check that the file still
+	// names this grant and the keyring write.
+	beforeItemWrite func()
+	access          string
+	expiry          time.Time
+	jmap            *jmapAccount // what the JMAP session said, cached
+	recent          []time.Time  // when the sends of the last minute started
 }
 
 func (b *emailBackend) Name() string { return "email" }
@@ -472,10 +475,16 @@ func (b *emailBackend) storeRotated(ctx context.Context) {
 	}
 	saving := b.unsaved.token
 	if b.config.inKeyring() {
-		if err := b.keys.write(ctx, b.config.GrantID, b.config.secrets(), b.lateWrite); err != nil {
+		grant := b.config.GrantID
+		if b.beforeItemWrite != nil {
+			b.beforeItemWrite()
+		}
+		err := b.keys.write(ctx, grant, b.config.secrets(), func() { b.lateWrite(grant) })
+		if err != nil {
 			log.Printf("warning: could not save the rotated refresh token to the keyring: %v; will retry, but the grant is lost if the daemon stops first", keyringFailure(err, b.config))
 			return
 		}
+		b.dropIfSuperseded(ctx, grant)
 	} else {
 		written, err := saveEmailConfig(b.path, b.config)
 		if err != nil {
@@ -489,17 +498,64 @@ func (b *emailBackend) storeRotated(ctx context.Context) {
 	}
 }
 
-// lateWrite runs when a keyring write the daemon gave up on finishes after
-// all. That write may have put an older token in the item than the newest
-// one, so the newest is written again.
-func (b *emailBackend) lateWrite() {
+// lateWrite runs when a keyring write to grant's item, which the daemon
+// gave up on, finishes after all. That write may have put an older token in
+// the item than the newest one, so the newest is written again; or the
+// grant may have been replaced meanwhile, and the write recreated an item
+// auth had deleted.
+func (b *emailBackend) lateWrite(grant string) {
 	go func() {
 		b.mu.Lock()
 		defer b.mu.Unlock()
 		ctx, cancel := context.WithTimeout(context.Background(), refreshTimeout)
 		defer cancel()
+		if b.dropIfSuperseded(ctx, grant) {
+			return
+		}
 		b.storeRotated(ctx)
 	}()
+}
+
+// dropIfSuperseded deletes grant's item when email.json no longer names
+// it, and says whether it did. Between its check that the file is
+// unchanged and its write, the daemon can recreate an item that oshirase
+// auth has just replaced and deleted; auth deletes the old item only after
+// writing the new file, so checking the file again after the write and
+// deleting the item if it is no longer named leaves none behind, whichever
+// of the two comes last. (A crash in between still can; the README says
+// how to find such items.)
+func (b *emailBackend) dropIfSuperseded(ctx context.Context, grant string) bool {
+	named, ok := fileGrantID(b.path)
+	if !ok || named == grant {
+		return false
+	}
+	if err := b.keys.remove(ctx, grant); err != nil {
+		log.Printf("warning: could not delete %s, the keyring item of a replaced grant: %v; delete it by hand (see the README)", keyringUser(grant), err)
+	} else {
+		log.Printf("email: deleted %s, the keyring item of a replaced grant", keyringUser(grant))
+	}
+	return true
+}
+
+// fileGrantID is the grant the file at path names now: "" with ok for a
+// file that keeps its secrets itself; not ok when it cannot be read, in
+// which case nothing should be deleted on its account.
+func fileGrantID(path string) (string, bool) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	var named struct {
+		Secrets string `json:"secrets"`
+		GrantID string `json:"grant_id"`
+	}
+	if json.Unmarshal(data, &named) != nil {
+		return "", false
+	}
+	if named.Secrets != secretsInKeyring {
+		return "", true
+	}
+	return named.GrantID, true
 }
 
 // sameVersion tells whether two stats are of the same write of the file.
@@ -587,8 +643,8 @@ func (b *emailBackend) refresh(ctx context.Context) (replaced bool, err error) {
 		// moment between it and the rename. In the keyring it is not needed
 		// for that: the token goes to the item of the grant this daemon
 		// loaded, keyed by its id, which can never be the new grant's. It
-		// still saves recreating the old item after auth deleted it, and
-		// switches to the new grant at once.
+		// switches to the new grant at once, and mostly saves recreating the
+		// old item after auth deleted it; dropIfSuperseded covers the rest.
 		if current, err := os.Stat(b.path); err != nil || !sameVersion(b.loaded, current) {
 			log.Printf("email: %s changed during a token refresh; keeping the file's grant", b.path)
 			b.loaded, b.access, b.expiry, b.jmap = nil, "", time.Time{}, nil

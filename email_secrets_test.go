@@ -136,10 +136,12 @@ func TestRotationUpdatesTheGrantsItem(t *testing.T) {
 	}
 }
 
-// `oshirase auth` makes grant B while the daemon refreshes grant A: B's
-// item and file stay as auth left them, A's item (which auth deleted) is
-// not recreated, and the daemon goes on with B.
-func TestStaleGrantCannotClobberANewOne(t *testing.T) {
+// `oshirase auth` makes grant B while the daemon's token request for grant
+// A is in flight, before the daemon checks the file (for after the check,
+// see TestStaleWriteAfterTheCheckLeavesNoItem): B's item and file stay as
+// auth left them, A's item (which auth deleted) is not recreated, and the
+// daemon goes on with B.
+func TestStaleGrantDuringTheTokenRequest(t *testing.T) {
 	backend, tokens, jmap := keyringFastmailSetup(t)
 	newer := *backend.config
 	newer.GrantID = "grant-b"
@@ -168,6 +170,50 @@ func TestStaleGrantCannotClobberANewOne(t *testing.T) {
 		t.Errorf("daemon on %s, item B holds %q", backend.config.GrantID, item.RefreshToken)
 	}
 
+}
+
+// The gap after the check: auth replaces the grant (new item, new file,
+// old item deleted) after the daemon has checked that the file is
+// unchanged but before its write of the rotated token, which recreates the
+// old grant's item. The daemon notices on checking the file again and
+// deletes it, so no live token is left behind.
+func TestStaleWriteAfterTheCheckLeavesNoItem(t *testing.T) {
+	logged := captureLog(t)
+	backend, tokens, _ := keyringFastmailSetup(t)
+	newer := *backend.config
+	newer.GrantID = "grant-b"
+	newer.setSecrets(emailSecrets{})
+	backend.beforeItemWrite = func() {
+		backend.beforeItemWrite = nil
+		keyringStore.set(context.Background(), "grant-b", emailSecrets{RefreshToken: "fresh-grant-SECRET"})
+		if _, err := saveEmailConfig(backend.path, &newer); err != nil {
+			t.Error(err)
+		}
+		keyringStore.remove(context.Background(), "grant-a")
+		tokens.mu.Lock()
+		tokens.current = "fresh-grant-SECRET"
+		tokens.mu.Unlock()
+	}
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := keyringItem(t, "grant-a"); ok {
+		t.Error("the old grant's item was left behind")
+	}
+	if item, _ := keyringItem(t, "grant-b"); item.RefreshToken != "fresh-grant-SECRET" {
+		t.Errorf("item B = %q", item.RefreshToken)
+	}
+	if !strings.Contains(logged.String(), "deleted email-grant-grant-a") {
+		t.Errorf("log: %s", logged)
+	}
+	// The next notification runs on the new grant.
+	backend.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	if err := backend.Notify(context.Background(), Notification{Title: "y", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	if backend.config.GrantID != "grant-b" {
+		t.Errorf("daemon on %s", backend.config.GrantID)
+	}
 }
 
 // A keyring that refuses is a 502 that says what is wrong and what to do,
