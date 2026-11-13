@@ -49,7 +49,16 @@ type Notification struct {
 	// together once they are out of date, e.g. "ssh-touch" when the key has
 	// been touched.
 	Tag string `json:"tag,omitempty"`
+	// Via picks how this one notification is delivered: empty for the
+	// daemon's own backend (the screen, normally), or ViaEmail for an
+	// email. A daemon older than the field ignores it and shows the
+	// notification as usual, so a client asking for email checks the
+	// backend named in the response.
+	Via string `json:"via,omitempty"`
 }
+
+// ViaEmail is the one value of Notification.Via so far.
+const ViaEmail = "email"
 
 // WithdrawRequest is the body of POST /v1/withdraw.
 type WithdrawRequest struct {
@@ -75,6 +84,9 @@ type HealthResponse struct {
 	Protocol int    `json:"protocol"`
 	Version  string `json:"version"`
 	Backend  string `json:"backend"`
+	// Via lists the values of Notification.Via this daemon can deliver
+	// now: "email" when an email grant is set up.
+	Via []string `json:"via"`
 }
 
 // ErrorResponse is the body of every non-2xx response.
@@ -95,6 +107,11 @@ func (n *Notification) Normalize() error {
 	case UrgencyLow, UrgencyNormal, UrgencyCritical:
 	default:
 		return fmt.Errorf("urgency must be low, normal or critical, not %q", n.Urgency)
+	}
+	switch n.Via {
+	case "", ViaEmail:
+	default:
+		return fmt.Errorf("via must be empty or %q, not %q", ViaEmail, n.Via)
 	}
 
 	fields := []struct {

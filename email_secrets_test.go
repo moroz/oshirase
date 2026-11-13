@@ -240,7 +240,7 @@ func TestKeyringErrorIs502(t *testing.T) {
 	request := httptest.NewRequest(http.MethodPost, "/v1/notify", strings.NewReader(`{"title":"x","body":"`+secretBody+`"}`))
 	request.Header.Set("Content-Type", "application/json")
 	recorder := httptest.NewRecorder()
-	notifyHandler(backend)(recorder, request)
+	notifyHandler(newRouter(backend))(recorder, request)
 	if recorder.Code != http.StatusBadGateway {
 		t.Fatalf("status %d", recorder.Code)
 	}

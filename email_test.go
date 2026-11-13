@@ -278,7 +278,7 @@ func TestRevokedRefreshTokenIs502WithAdvice(t *testing.T) {
 	backend, tokens, _ := googleSetup(t)
 	tokens.failure = `{"error":"invalid_grant","error_description":"Token has been expired or revoked."}`
 
-	handler := notifyHandler(backend)
+	handler := notifyHandler(newRouter(backend))
 	request := httptest.NewRequest(http.MethodPost, "/v1/notify",
 		strings.NewReader(`{"title":"Touch key","body":"`+secretBody+`","source":"ssh"}`))
 	request.Header.Set("Content-Type", "application/json")

@@ -34,10 +34,11 @@ func runServe(args []string) error {
 	if err != nil {
 		return err
 	}
+	routes := newRouter(backend)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/health", healthHandler(backend))
-	mux.HandleFunc("POST /v1/notify", notifyHandler(backend))
+	mux.HandleFunc("GET /v1/health", healthHandler(routes))
+	mux.HandleFunc("POST /v1/notify", notifyHandler(routes))
 	mux.HandleFunc("POST /v1/withdraw", withdrawHandler(backend))
 
 	server := &http.Server{
@@ -97,18 +98,19 @@ func rejectBrowsers(next http.Handler) http.Handler {
 	})
 }
 
-func healthHandler(backend Backend) http.HandlerFunc {
+func healthHandler(routes *router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		response := HealthResponse{
 			Protocol: ProtocolVersion,
 			Version:  version,
-			Backend:  backend.Name(),
+			Backend:  routes.primary.Name(),
+			Via:      routes.available(),
 		}
 		writeJSON(w, http.StatusOK, response)
 	}
 }
 
-func notifyHandler(backend Backend) http.HandlerFunc {
+func notifyHandler(routes *router) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var notification Notification
 		if !decodeJSON(w, r, &notification) {
@@ -118,16 +120,22 @@ func notifyHandler(backend Backend) http.HandlerFunc {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		backend, err := routes.pick(notification.Via)
+		if err != nil {
+			log.Printf("cannot deliver via %s: %v", notification.Via, err)
+			writeError(w, http.StatusNotImplemented, err.Error())
+			return
+		}
 
 		ctx, cancel := context.WithTimeout(r.Context(), notifyTimeout)
 		defer cancel()
 		if err := backend.Notify(ctx, notification); err != nil {
-			log.Printf("delivery failed: source=%q title=%q: %v", notification.Source, notification.Title, err)
+			log.Printf("delivery failed: backend=%s source=%q title=%q: %v", backend.Name(), notification.Source, notification.Title, err)
 			writeError(w, http.StatusBadGateway, err.Error())
 			return
 		}
 
-		log.Printf("delivered: urgency=%s source=%q title=%q", notification.Urgency, notification.Source, notification.Title)
+		log.Printf("delivered: backend=%s urgency=%s source=%q title=%q", backend.Name(), notification.Urgency, notification.Source, notification.Title)
 		response := NotifyResponse{Delivered: true, Backend: backend.Name()}
 		writeJSON(w, http.StatusOK, response)
 	}
