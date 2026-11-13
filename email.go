@@ -186,6 +186,10 @@ func newEmailBackend(path string) (*emailBackend, error) {
 	}, nil
 }
 
+// refreshTimeout bounds a token refresh, which is not cut short when the
+// notification's own request is; see accessToken.
+const refreshTimeout = 15 * time.Second
+
 type emailBackend struct {
 	path         string
 	http         *http.Client
@@ -265,7 +269,14 @@ func (b *emailBackend) accessToken(ctx context.Context) (string, error) {
 		ClientSecret:  b.config.ClientSecret,
 		HTTP:          b.http,
 	}
-	token, err := client.refresh(ctx, b.config.RefreshToken)
+	// The refresh and the save of a rotated token run on a context of their
+	// own. The request's context ends when the caller gives up (oshirase
+	// send waits 5 seconds, some callers 3), and a refresh cut off after
+	// Fastmail rotated the token but before the save would lose the new
+	// token, leaving the old one, whose next use revokes the grant.
+	refreshCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), refreshTimeout)
+	defer cancel()
+	token, err := client.refresh(refreshCtx, b.config.RefreshToken)
 	if err != nil {
 		return "", b.refreshFailure(err)
 	}

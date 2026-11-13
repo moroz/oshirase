@@ -34,6 +34,7 @@ type fakeTokenEndpoint struct {
 	current  string // the refresh token it accepts
 	rotate   bool
 	failure  string // a JSON error body to answer with, status 400
+	hold     func() // runs before answering, e.g. to make the caller give up
 	requests int
 	access   []string // access tokens it has issued
 }
@@ -47,6 +48,9 @@ func (f *fakeTokenEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if got := r.PostForm.Get("client_secret"); got != f.secret {
 		f.t.Errorf("client_secret = %q, want %q", got, f.secret)
+	}
+	if f.hold != nil {
+		f.hold()
 	}
 	if f.failure != "" {
 		w.Header().Set("Content-Type", "application/json")
@@ -478,6 +482,27 @@ func TestJMAPSendsAndPersistsTheRotatedRefreshToken(t *testing.T) {
 		t.Errorf("sessions = %d, refreshes = %d; want 1 and 1", jmap.sessions, tokens.requests)
 	}
 	assertNoSecrets(t, "log", logged.String())
+}
+
+// A caller that gives up during the refresh must not cost the rotated
+// refresh token: the refresh finishes and the new token is saved.
+func TestRotatedTokenSurvivesTheCallerGivingUp(t *testing.T) {
+	backend, tokens, _ := fastmailSetup(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	tokens.hold = func() {
+		cancel()
+		time.Sleep(50 * time.Millisecond) // let the cancellation land
+	}
+	if err := backend.Notify(ctx, Notification{Title: "x", Urgency: UrgencyNormal}); err == nil {
+		t.Fatal("want the send to fail on the cancelled context")
+	}
+	saved, _, err := loadEmailConfig(backend.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.RefreshToken != tokens.current || saved.RefreshToken == secretRefresh {
+		t.Errorf("saved %q, the endpoint now expects %q", saved.RefreshToken, tokens.current)
+	}
 }
 
 func TestJMAPNotCreatedIsAnError(t *testing.T) {
