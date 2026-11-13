@@ -105,6 +105,124 @@ cannot reach the host's loopback; the daemon listens on the bridge as well
 `oshirase send` exits non-zero when the daemon did not answer or refused, so a
 caller can fall back to something else.
 
+## Email backend
+
+```sh
+oshirase serve -backend email
+```
+
+delivers every notification as an email instead of putting it on the
+screen, for being reached away from the host. It works the same on macOS
+and Linux. The subject is the title tagged with the source,
+`[oshirase · ssh] Touch your security key`; the body is the body (or the
+title again, when there is none). `critical` is marked `Importance: high`
+and `X-Priority: 1`, `low` the opposite, so a mail client can sort or
+alert on it. If the provider refuses — a revoked grant, an HTTP error — the
+daemon answers 502 with the reason and what to run, e.g. `refresh token
+revoked or expired (invalid_grant: ...); run oshirase auth google`.
+
+Each grant is made once, interactively, **on the host** (the machine the
+daemon runs on): `oshirase auth` prints a URL, you open it in a browser on
+that machine, and the provider redirects back to a listener on
+`127.0.0.1:<random port>`. The authorization-code flow uses PKCE. The
+result goes to `email.json` in the user configuration directory:
+
+| | |
+|---|---|
+| Linux | `$XDG_CONFIG_HOME/oshirase/email.json` (else `~/.config/oshirase/`) |
+| macOS | `~/Library/Application Support/oshirase/email.json` |
+| anywhere | `$OSHIRASE_EMAIL_CONFIG`, or `-config` on `oshirase auth` |
+
+The file holds a long-lived credential, so it is written with mode 0600 in a
+0700 directory, and the daemon warns if it finds it readable by others. It
+is JSON (`provider`, `to`, `from`, `client_id`, `client_secret`,
+`token_endpoint`, `refresh_token` or `api_token`, `jmap_session`). The
+daemon reloads it when it changes, so re-running `oshirase auth` repairs a
+revoked grant without a restart. The daemon refuses to start with
+`-backend email` and no file. Neither it nor `oshirase auth` logs a token
+or a message body.
+
+### Gmail and Google Workspace
+
+Sending goes through the Gmail API (`users.messages.send`) with the scope
+`https://www.googleapis.com/auth/gmail.send`, which can send as you and
+cannot read your mail. Google has no client for oshirase to share: you
+create your own in a Google Cloud project of your own, and bring its id and
+secret. A Desktop app client's "secret" is not secret in the usual sense —
+Google treats installed apps as public clients and relies on PKCE and the
+loopback redirect — but it is yours, not oshirase's.
+
+1. In the [Google Cloud console](https://console.cloud.google.com/), create
+   a project (or pick one) and enable the **Gmail API** for it.
+2. **Google Auth platform → Branding / Audience**: configure the consent
+   screen. With Google Workspace, choose **Internal**. With a personal
+   account, choose **External** and add yourself as a test user.
+3. **Google Auth platform → Clients → Create Client**, application type
+   **Desktop app**. Download its JSON.
+4. Run:
+
+   ```sh
+   oshirase auth google -credentials ~/Downloads/client_secret_….json -to you@example.com
+   ```
+
+   (or `-client-id` and `-client-secret`). `-from` is optional: Gmail sends
+   as the account that granted access.
+
+**Refresh tokens of an External app in "Testing" expire after 7 days**, so
+the backend would stop with `invalid_grant` once a week. To avoid that, use
+an Internal app (Workspace), or under **Audience** publish the app to
+**In production**. gmail.send is a *sensitive* scope, so an unverified app
+in production shows an "unverified app" warning on the consent screen,
+which you click through once; verification is only needed to offer the app
+to other people. A grant also lapses after six months unused, or when you
+revoke it at myaccount.google.com/permissions.
+
+### Fastmail
+
+Fastmail implements the [OAuth Profile for Open Public
+Clients](https://datatracker.ietf.org/doc/draft-ietf-mailmaint-oauth-public/):
+a native app registers itself as a public client through dynamic client
+registration (RFC 7591), with no client id, secret or agreement to obtain
+from Fastmail first. Registering by hand with Fastmail is only for clients
+with a public (https) redirect URI. So:
+
+```sh
+oshirase auth fastmail -to you@example.com
+```
+
+discovers the endpoints at
+`https://api.fastmail.com/.well-known/oauth-authorization-server`,
+registers a client, asks for the scopes `urn:ietf:params:oauth:scope:mail`
+and `offline_access`, and sends you through the consent page. It then reads
+the JMAP session with the new grant, to make sure it may send, and records
+the sending identity (`-from`, else the account's first identity).
+
+Fastmail rotates the refresh token on every use and revokes the grant if an
+old one is used again. The daemon writes each new refresh token back to the
+file before it sends, so **do not copy `email.json` to a second machine**:
+the two would spend each other's tokens. Make one grant per machine.
+
+If OAuth does not suit, a Fastmail **API token** does the same job without
+it. Make one in Settings → Privacy & Security → API tokens with access to
+**Email** (not read-only) and **Email submission**, then:
+
+```sh
+oshirase auth fastmail -api-token -to you@example.com < token.txt
+```
+
+An API token does not expire; revoke it on the same settings page.
+
+### What it costs
+
+An email is slower than a banner. The daemon's part is a token refresh
+about once an hour and, for Fastmail, a JMAP session lookup on the first
+notification, then one request to send: a few hundred milliseconds, within
+the 10-second limit on a delivery. After that it is the provider's delivery
+and the phone's push, typically seconds, sometimes a minute. Every
+notification becomes a message — in Sent, and in the recipient's inbox,
+`low` and `normal` ones included — so send to an address whose inbox you
+are willing to fill, or filter on the `[oshirase` subject prefix.
+
 ## Protocol (v1)
 
 Fields may be added to v1; none are removed or change meaning. Unknown fields
