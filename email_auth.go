@@ -92,7 +92,7 @@ func runAuthGoogle(ctx context.Context, args []string) error {
 	flags := flag.NewFlagSet("auth google", flag.ContinueOnError)
 	credentials := flags.String("credentials", "", "the client JSON downloaded from Google Cloud (Desktop app client)")
 	clientID := flags.String("client-id", "", "OAuth client id, if not using -credentials")
-	clientSecret := flags.String("client-secret", "", "OAuth client secret, if not using -credentials")
+	clientSecret := flags.String("client-secret", "", "OAuth client secret, if not using -credentials (shows in ps and shell history; prefer -credentials)")
 	to, from, configFlag := addressFlags(flags)
 	if err := flags.Parse(args); err != nil {
 		return err

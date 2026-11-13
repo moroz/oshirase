@@ -189,8 +189,10 @@ loopback redirect — but it is yours, not oshirase's.
    oshirase auth google -credentials ~/Downloads/client_secret_….json -to you@example.com
    ```
 
-   (or `-client-id` and `-client-secret`). `-from` is optional: Gmail sends
-   as the account that granted access.
+   Prefer `-credentials` to `-client-id` and `-client-secret`: a secret on
+   the command line shows in `ps` to every user of the machine and stays in
+   your shell history. `-from` is optional: Gmail sends as the account that
+   granted access.
 
 **Refresh tokens of an External app in "Testing" expire after 7 days**, so
 the backend would stop with `invalid_grant` once a week. To avoid that, use
