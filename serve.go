@@ -39,6 +39,7 @@ func runServe(args []string) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/health", healthHandler(backend))
 	mux.HandleFunc("POST /v1/notify", notifyHandler(backend))
+	mux.HandleFunc("POST /v1/withdraw", withdrawHandler(backend))
 
 	server := &http.Server{
 		Handler:           rejectBrowsers(mux),
@@ -172,6 +173,45 @@ func notifyHandler(backend Backend) http.HandlerFunc {
 		log.Printf("delivered: urgency=%s source=%q title=%q", notification.Urgency, notification.Source, notification.Title)
 		response := NotifyResponse{Delivered: true, Backend: backend.Name()}
 		writeJSON(w, http.StatusOK, response)
+	}
+}
+
+func withdrawHandler(backend Backend) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		withdrawer, ok := backend.(Withdrawer)
+		if !ok {
+			writeError(w, http.StatusNotImplemented, "the "+backend.Name()+" backend cannot withdraw notifications")
+			return
+		}
+		mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+		if mediaType != "application/json" {
+			writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be application/json")
+			return
+		}
+
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestSize)
+		var request WithdrawRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+			return
+		}
+		if err := NormalizeTag(request.Tag); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+
+		ctx, cancel := context.WithTimeout(r.Context(), notifyTimeout)
+		defer cancel()
+		count, err := withdrawer.Withdraw(ctx, request.Tag)
+		if err != nil {
+			log.Printf("withdraw failed: tag=%q after %d: %v", request.Tag, count, err)
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		if count > 0 {
+			log.Printf("withdrew %d: tag=%q", count, request.Tag)
+		}
+		writeJSON(w, http.StatusOK, WithdrawResponse{Withdrawn: count, Backend: backend.Name()})
 	}
 }
 

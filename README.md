@@ -118,6 +118,7 @@ are ignored.
 | `body` | optional | up to 4096 characters |
 | `urgency` | optional | `low`, `normal` (default) or `critical` |
 | `source` | optional | what sent it, e.g. `ssh`; up to 64 characters |
+| `tag` | optional | groups notifications for `POST /v1/withdraw`, e.g. `ssh-touch`; up to 64 characters |
 
 | Status | Body |
 |---|---|
@@ -126,9 +127,16 @@ are ignored.
 | 403 | the request carried an `Origin` header |
 | 502 | `{"error": "..."}` — the platform refused to show it |
 
+`POST /v1/withdraw`, `Content-Type: application/json`, `{"tag": "..."}`
+takes down every notification sent with that tag that may still be on
+screen, e.g. a "touch your key" notice once the key has been touched
+(`oshirase withdraw -tag ssh-touch`). It answers
+`{"withdrawn": 2, "backend": "freedesktop"}`, counting what it closed, or
+501 from a backend that cannot withdraw (macOS, for now).
+
 `GET /v1/health` → `{"protocol": 1, "version": "...", "backend": "..."}`.
 
-Any request with an `Origin` header is refused, and `/v1/notify` requires a
+Any request with an `Origin` header is refused, and both POST endpoints require a
 JSON content type, so a web page open on the host cannot send notifications
 through the daemon.
 
