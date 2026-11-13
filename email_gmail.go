@@ -109,7 +109,8 @@ func encodeSubject(subject string) string {
 }
 
 // buildRFC5322 writes a plain-text UTF-8 message. Gmail fills in From (as
-// the authorized account) when it is empty, and Message-ID.
+// the authorized account) when it is empty, and Message-ID; SMTP passes its
+// own Message-ID among message.Headers.
 func buildRFC5322(from, to string, message emailMessage, now time.Time) []byte {
 	var out bytes.Buffer
 	header := func(name, value string) {

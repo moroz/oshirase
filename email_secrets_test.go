@@ -18,11 +18,24 @@ import (
 
 // TestMain swaps go-keyring for its in-memory mock before any test runs, so
 // no test can reach the real keyring of the machine running them, even one
-// that forgets to set up the mock itself.
+// that forgets to set up the mock itself. It also skips osKeyring's look
+// for a D-Bus session bus, which the mock does not need: without that, the
+// keyring tests failed on a machine with no session bus (a container, CI).
 func TestMain(m *testing.M) {
 	keyring.MockInit()
+	keyringStore.api = mockedKeyring{}
 	os.Exit(m.Run())
 }
+
+// mockedKeyring is osKeyring without the session bus check; go-keyring's
+// functions reach whatever provider MockInit installed last.
+type mockedKeyring struct{}
+
+func (mockedKeyring) Get(service, user string) (string, error) { return keyring.Get(service, user) }
+func (mockedKeyring) Set(service, user, password string) error {
+	return keyring.Set(service, user, password)
+}
+func (mockedKeyring) Delete(service, user string) error { return keyring.Delete(service, user) }
 
 // freshKeyring gives the test an empty mock keyring.
 func freshKeyring(t *testing.T) {

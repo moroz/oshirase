@@ -17,10 +17,12 @@ import (
 	"slices"
 	"strings"
 	"time"
+
+	"golang.org/x/term"
 )
 
-// `oshirase auth google|fastmail` makes the grant the email backend uses,
-// once, interactively, and stores it: the secrets in the OS keyring (or,
+// `oshirase auth google|fastmail|smtp` makes the grant the email backend
+// uses (for smtp, checks the password), once, interactively, and stores it: the secrets in the OS keyring (or,
 // with -store file, in email.json), the rest in email.json.
 
 const authUsage = `usage:
@@ -28,6 +30,7 @@ const authUsage = `usage:
   oshirase auth google -client-id ID -client-secret SECRET -to you@example.com [-from addr]
   oshirase auth fastmail -to you@example.com [-from addr]
   oshirase auth fastmail -api-token -to you@example.com [-from addr] < token
+  oshirase auth smtp -host smtp.example.com:465 -username you@example.com -to you@example.com [-from addr]
 
 Every form takes -store keyring (the default) or -store file, and -config path.
 `
@@ -54,6 +57,8 @@ func runAuth(args []string) error {
 		return runAuthGoogle(ctx, args[1:])
 	case providerFastmail:
 		return runAuthFastmail(ctx, args[1:])
+	case providerSMTP:
+		return authSMTP(ctx, args[1:], os.Stdin, os.Stderr, smtpTransport{})
 	default:
 		fmt.Fprint(os.Stderr, authUsage)
 		return errUsage
@@ -528,4 +533,113 @@ func registerClient(ctx context.Context, endpoint, scope string, httpc *http.Cli
 		return "", errors.New("registering the client: the response carried no client_id")
 	}
 	return registered.ClientID, nil
+}
+
+// authSMTP is `oshirase auth smtp`: it reads the password (never from the
+// command line, where ps and the shell history would show it), logs in to
+// the server once to check it, without sending anything, and only then
+// stores it. stdin, report and transport are the terminal and the network,
+// but for tests.
+func authSMTP(ctx context.Context, args []string, stdin io.Reader, report io.Writer, transport smtpTransport) error {
+	flags := flag.NewFlagSet("auth smtp", flag.ContinueOnError)
+	flags.SetOutput(report)
+	host := flags.String("host", "", "the SMTP server as host:port: port 465 is TLS from the start, any other port must offer STARTTLS (required)")
+	username := flags.String("username", "", "the account to log in as (default: -from)")
+	common := addAuthFlags(flags)
+	flags.Lookup("from").Usage = "address to send as (default: -username, when that is an address)"
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() > 0 {
+		// Not quoted back: one of them may be the password.
+		return errors.New("unexpected arguments after the flags; the password is read from the terminal or standard input, never from the command line")
+	}
+	if err := checkSMTPHost(*host); err != nil {
+		return fmt.Errorf("-host: %w", err)
+	}
+	from := *common.from
+	if from == "" {
+		if !isBareAddress(*username) {
+			return errors.New("give -from, the address to send as (it defaults to -username only when that is an email address)")
+		}
+		from = *username
+	}
+	*common.from = from
+	path, err := common.check()
+	if err != nil {
+		return err
+	}
+
+	config := &emailConfig{Provider: providerSMTP, SMTPHost: *host, Username: *username, From: from, To: *common.to}
+	account := config.smtpAccount()
+	config.SMTPPassword, err = readSMTPPassword(stdin, report, account.Username, account.Host)
+	if err != nil {
+		return err
+	}
+	if err := config.validate(); err != nil {
+		return err
+	}
+
+	fmt.Fprintf(report, "Logging in to %s as %s to check the password (nothing is sent)...\n", account.Host, account.Username)
+	if err := transport.probe(ctx, config.smtpAccount()); err != nil {
+		return fmt.Errorf("checking the password, nothing saved: %w", err)
+	}
+	oldFastmailGrant := isFastmailOAuth(path)
+	if err := storeGrant(ctx, path, config, *common.store, report); err != nil {
+		return err
+	}
+	fmt.Fprintf(report, "Saved the SMTP password: %s. Notifications will be sent as %s to %s through %s.\nStart the daemon with: oshirase serve -backend email\n",
+		describeStore(path, config), config.From, config.To, config.SMTPHost)
+	if oldFastmailGrant {
+		fmt.Fprintln(report, "This replaced a Fastmail OAuth grant, which can still read and delete your mail: revoke it in Fastmail's settings (see the README, \"SMTP (send-only)\").")
+	}
+	return nil
+}
+
+// isBareAddress is whether text is an address and nothing else, the way a
+// username can double as one: no display name, no angle brackets.
+func isBareAddress(text string) bool {
+	address, err := mail.ParseAddress(text)
+	return err == nil && address.Address == text
+}
+
+// isFastmailOAuth is whether the configuration at path is a Fastmail OAuth
+// grant (not an API token), the one SMTP is meant to replace.
+func isFastmailOAuth(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	var named struct {
+		Provider string `json:"provider"`
+		ClientID string `json:"client_id"`
+	}
+	return json.Unmarshal(data, &named) == nil && named.Provider == providerFastmail && named.ClientID != ""
+}
+
+// readSMTPPassword reads the password without echo when input is a
+// terminal, and otherwise one line of it, so a password manager can pipe
+// it in. Only the line ending is taken off: spaces may be part of it.
+func readSMTPPassword(input io.Reader, prompt io.Writer, username, host string) (string, error) {
+	var line string
+	if file, ok := input.(*os.File); ok && term.IsTerminal(int(file.Fd())) {
+		fmt.Fprintf(prompt, "Password for %s at %s (not shown as you type): ", username, host)
+		typed, err := term.ReadPassword(int(file.Fd()))
+		fmt.Fprintln(prompt)
+		if err != nil {
+			return "", fmt.Errorf("reading the password: %w", err)
+		}
+		line = string(typed)
+	} else {
+		read, err := bufio.NewReader(input).ReadString('\n')
+		if err != nil && !errors.Is(err, io.EOF) {
+			return "", fmt.Errorf("reading the password: %w", err)
+		}
+		line = read
+	}
+	password := strings.TrimRight(line, "\r\n")
+	if password == "" {
+		return "", errors.New("no password: type it at the prompt, or give it as one line on standard input")
+	}
+	return password, nil
 }

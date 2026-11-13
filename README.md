@@ -163,7 +163,8 @@ revoked or expired (invalid_grant: ...); run oshirase auth google`.
 Each grant is made once, interactively, **on the host** (the machine the
 daemon runs on): `oshirase auth` prints a URL, you open it in a browser on
 that machine, and the provider redirects back to a listener on
-`127.0.0.1:<random port>`. The authorization-code flow uses PKCE. The
+`127.0.0.1:<random port>`. The authorization-code flow uses PKCE. (SMTP,
+below, has no browser step: `oshirase auth smtp` asks for a password.) The
 secrets go into the OS keyring (below) and everything else into
 `email.json` in the user configuration directory:
 
@@ -173,19 +174,21 @@ secrets go into the OS keyring (below) and everything else into
 | macOS | `~/Library/Application Support/oshirase/email.json` |
 | anywhere | `$OSHIRASE_EMAIL_CONFIG`, or `-config` on `oshirase auth` |
 
-`email.json` is JSON (`provider`, `to`, `from`, `client_id`,
-`token_endpoint`, `jmap_session`, `max_per_minute`, `secrets`, `grant_id`,
-and, in file mode only, `refresh_token`, `api_token` and `client_secret`),
+`email.json` is JSON (`provider` — `google`, `fastmail` or `smtp` — `to`,
+`from`, `client_id`, `token_endpoint`, `jmap_session`, `smtp_host`,
+`username`, `max_per_minute`, `secrets`, `grant_id`, and, in file mode
+only, `refresh_token`, `api_token`, `client_secret` and `smtp_password`),
 written with mode 0600 in a 0700 directory. The daemon reloads it when it
 changes, so re-running `oshirase auth` repairs a revoked grant without a
 restart. The daemon refuses to start with `-backend email` and no file; with
 another backend it starts anyway, and answers `via: "email"` with 501 until
-there is one. Neither it nor `oshirase auth` logs a token or a message body.
+there is one. Neither it nor `oshirase auth` logs a token, a password or a
+message body.
 
 ### Where the secrets are
 
-The refresh token (or Fastmail API token) and Google's client secret are
-kept in the OS keyring, one item per grant, under the service `oshirase`
+The refresh token (or Fastmail API token), Google's client secret and the
+SMTP password are kept in the OS keyring, one item per grant, under the service `oshirase`
 and the account `email-grant-<grant id>`; `email.json` says
 `"secrets": "keyring"` and names the grant, and holds no secret.
 
@@ -240,7 +243,8 @@ security delete-generic-password -s oshirase -a email-grant-<grant id>
 ```
 
 Revoking the grant with the provider as well (Google's account
-permissions page, Fastmail's settings) makes a leftover token worthless.
+permissions page, Fastmail's settings; for SMTP, deleting the app
+password) makes a leftover token or password worthless.
 
 Anything that can reach the daemon can make it send mail from your
 account, so it sends at most 10 emails in any minute and answers 502 to
@@ -286,6 +290,10 @@ revoke it at myaccount.google.com/permissions.
 
 ### Fastmail
 
+A Fastmail OAuth grant or API token can read and delete your mail as well
+as send it; for a credential that can only send, use [SMTP
+(send-only)](#smtp-send-only) below instead.
+
 Fastmail implements the [OAuth Profile for Open Public
 Clients](https://datatracker.ietf.org/doc/draft-ietf-mailmaint-oauth-public/):
 a native app registers itself as a public client through dynamic client
@@ -320,6 +328,81 @@ oshirase auth fastmail -api-token -to you@example.com < token.txt
 
 An API token does not expire; revoke it on the same settings page.
 
+### SMTP (send-only)
+
+A Fastmail OAuth grant (above) can do more than send: Fastmail has no OAuth
+scope for sending alone, so the grant can also read and delete everything
+in the mailbox, and so can anyone who gets the refresh token. A Fastmail
+**app password restricted to SMTP** can only send mail. With provider
+`smtp`, oshirase sends over SMTP submission with such a password, and the
+worst a stolen password can do is send mail as you (which you stop by
+deleting it).
+
+1. In Fastmail's settings, under **Privacy & Security**, make a new **app
+   password**, and when it asks what the password may access, choose the
+   option that allows **SMTP** only (not IMAP, POP, CalDAV or the rest).
+   The exact labels of that page may differ from these; what matters is
+   that SMTP is the only access granted. Fastmail shows the password once.
+2. Run, on the host, with your Fastmail login as `-username`:
+
+   ```sh
+   oshirase auth smtp -host smtp.fastmail.com:465 -username you@fastmail.com -to phone@example.com
+   ```
+
+   It asks for the password without showing it as you type. When standard
+   input is not a terminal it reads one line from it instead, so a password
+   manager can pipe it in (`pass show fastmail/oshirase-smtp | oshirase
+   auth smtp ...`). It is never taken from the command line, where `ps`
+   and your shell history would show it. `-from` is the address to send as
+   (the envelope sender and the `From:` header), by default `-username`
+   when that is an address; with Fastmail it must be one of your sending
+   identities. `-store file` and `-config` work as for the other providers.
+3. Before saving anything, `oshirase auth smtp` logs in to the server and
+   quits again, sending nothing. If the password is refused, nothing is
+   saved and the previous grant stays in place. Otherwise the password goes
+   into the keyring (or `email.json` with `-store file`), replacing the
+   previous grant and deleting its keyring item.
+4. If you were using the Fastmail OAuth grant, **revoke it** in Fastmail's
+   settings (under Privacy & Security, where Fastmail lists the apps and
+   passwords with access to your account): deleting oshirase's keyring
+   item does not revoke it, and until it is revoked the refresh token can
+   still read and delete your mail. `oshirase auth smtp` reminds you when it
+   replaces one.
+
+The port in `-host` (`smtp_host` in `email.json`) decides how the
+connection is encrypted:
+
+- **465**: TLS from the first byte (implicit TLS, RFC 8314). Fastmail's
+  `smtp.fastmail.com:465` is this.
+- **Any other port** (normally 587): a plain connection that must be
+  upgraded with STARTTLS before logging in. A server that does not offer
+  STARTTLS is refused before the password is sent; oshirase never logs in
+  over an unencrypted connection.
+
+Either way the server's certificate is verified against the host name in
+`smtp_host` with the system's roots, and there is no option to skip that.
+Logging in uses AUTH PLAIN over the encrypted connection. Each message is
+sent with `MAIL FROM` = `from`, `RCPT TO` = `to`, and carries `Date`, a
+`Message-ID` on `from`'s domain, and the priority headers. A refused
+password answers `the SMTP server smtp.fastmail.com:465 refused the
+password (535 ...); make a new app password and run oshirase auth smtp`.
+Other providers' SMTP submission servers work the same way, with their own
+host and app password.
+
+`email.json` for SMTP, in keyring mode:
+
+```json
+{
+  "provider": "smtp",
+  "to": "phone@example.com",
+  "from": "you@fastmail.com",
+  "smtp_host": "smtp.fastmail.com:465",
+  "username": "you@fastmail.com",
+  "secrets": "keyring",
+  "grant_id": "…"
+}
+```
+
 ### What it costs
 
 An email is slower than a banner. The daemon's part is a token refresh
@@ -330,8 +413,8 @@ and the phone's push, typically seconds, sometimes a minute. Every
 notification becomes a message in the recipient's inbox, `low` and
 `normal` ones included, so send to an address whose inbox you are willing
 to fill, or filter on the `[oshirase` subject prefix. Gmail also keeps a
-copy in Sent; with Fastmail the daemon deletes its copy once the message
-is sent, so a recipient that delivers into the same account (one of your
+copy in Sent; SMTP keeps none (no request saves one); with Fastmail's JMAP
+the daemon deletes its copy once the message is sent, so a recipient that delivers into the same account (one of your
 own addresses) gets each notification once, not twice.
 
 ## Protocol (v1)
