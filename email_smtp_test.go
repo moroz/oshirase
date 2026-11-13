@@ -10,12 +10,15 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math/big"
 	"mime"
 	"net"
+	"net/http"
+	"net/http/httptest"
 	"net/mail"
 	"net/textproto"
 	"os"
@@ -739,4 +742,77 @@ func TestReadSMTPPassword(t *testing.T) {
 			t.Errorf("%q: accepted", input)
 		}
 	}
+}
+
+// The daemon's real path for an SMTP grant: GET /v1/health lists email,
+// a notification with via: email reaches the SMTP server, the rate limit
+// answers instead of sending, and a new password from oshirase auth smtp
+// is picked up without a restart.
+func TestSMTPViaEmailHealthAndReload(t *testing.T) {
+	freshKeyring(t)
+	logs := captureLog(t)
+	server := newFakeSMTP(t, true)
+	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
+	t.Setenv("OSHIRASE_EMAIL_CONFIG", path)
+	auth := func(password string) {
+		t.Helper()
+		args := []string{"-host", "127.0.0.1:465", "-username", "me@fastmail.com", "-to", "phone@example.com"}
+		if err := authSMTP(context.Background(), args, strings.NewReader(password+"\n"), io.Discard, server.transport()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	auth(secretSMTPPassword)
+	// Two a minute, so the third is refused.
+	config, _, _ := loadEmailConfig(path)
+	config.MaxPerMinute = 2
+	saveEmailConfig(path, config)
+
+	screen := &recordingBackend{name: "freedesktop"}
+	routes := newRouter(screen)
+	routes.openEmail = func() (Backend, error) {
+		backend, err := openEmailBackend()
+		if err == nil {
+			backend.(*emailBackend).smtpNet = server.transport()
+		}
+		return backend, err
+	}
+
+	recorder := httptest.NewRecorder()
+	healthHandler(routes)(recorder, httptest.NewRequest(http.MethodGet, "/v1/health", nil))
+	var health HealthResponse
+	json.Unmarshal(recorder.Body.Bytes(), &health)
+	if !slices.Equal(health.Via, []string{ViaEmail}) {
+		t.Errorf("health via = %q", health.Via)
+	}
+
+	if got := notify(t, routes, `{"title":"first","via":"email"}`); got.Code != http.StatusOK {
+		t.Fatalf("%d %s", got.Code, got.Body)
+	}
+	if got := notify(t, routes, `{"title":"on screen"}`); got.Code != http.StatusOK || len(screen.got) != 1 {
+		t.Fatalf("%d %s", got.Code, got.Body)
+	}
+
+	// A new app password: the old one stops working, auth stores the new
+	// one in a new keyring item, and the daemon reloads.
+	const newPassword = "second-SECRET-password"
+	server.set(func(f *fakeSMTP) { f.password = newPassword })
+	auth(newPassword)
+	config, _, _ = loadEmailConfig(path)
+	config.MaxPerMinute = 2
+	saveEmailConfig(path, config)
+	if got := notify(t, routes, `{"title":"second","via":"email"}`); got.Code != http.StatusOK {
+		t.Fatalf("after re-auth: %d %s", got.Code, got.Body)
+	}
+	if got := notify(t, routes, `{"title":"third","via":"email"}`); got.Code == http.StatusOK || !strings.Contains(got.Body.String(), "max_per_minute") {
+		t.Errorf("over the limit: %d %s", got.Code, got.Body)
+	}
+
+	state := server.state()
+	if len(state.messages) != 2 || state.logins[len(state.logins)-1] != "me@fastmail.com:"+newPassword {
+		t.Errorf("messages %d, logins %q", len(state.messages), state.logins)
+	}
+	if !strings.Contains(logs.String(), "reloaded "+path+" (provider smtp)") {
+		t.Errorf("no reload in the log: %s", logs.String())
+	}
+	assertNoSecrets(t, "log", logs.String())
 }
