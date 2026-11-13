@@ -14,8 +14,10 @@ set -euo pipefail
 
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 binary="$HOME/.local/bin/oshirase"
-unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
-env_file="${XDG_CONFIG_HOME:-$HOME/.config}/oshirase/env"
+# systemd's %E: the user manager's XDG_CONFIG_HOME, else ~/.config.
+config_home="$(systemctl --user show-environment 2>/dev/null | sed -n 's/^XDG_CONFIG_HOME=//p')"
+unit_dir="${config_home:-$HOME/.config}/systemd/user"
+env_file="${config_home:-$HOME/.config}/oshirase/env"
 port=4649
 
 say() { printf '==> %s\n' "$*" >&2; }
@@ -38,19 +40,40 @@ fi
 # On its own line so set -e stops here if the binary cannot run.
 version="$("$source_binary" version)"
 
-listen="${OSHIRASE_LISTEN:-}"
-if [[ -z $listen ]]; then
-  listen="127.0.0.1:$port"
-  while read -r address; do
-    listen+=",$address:$port"
-  done < <(ip -4 -o addr show 2>/dev/null | awk '$2 ~ /^virbr/ { split($4, a, "/"); print a[1] }')
-fi
+command -v curl >/dev/null || { say "curl is needed for the health check"; exit 1; }
 
-say "Installing $binary ($version), listening on $listen"
-mkdir -p "$(dirname "$binary")" "$unit_dir" "$(dirname "$env_file")"
+mkdir -p "$(dirname "$binary")" "$unit_dir"
+# 0700: the email backend keeps its tokens beside the env file.
+mkdir -p -m 0700 "$(dirname "$env_file")"
+chmod 0700 "$(dirname "$env_file")"
+
+# The env file is the daemon's settings. A rerun keeps one that exists, hand
+# edits included, unless OSHIRASE_LISTEN asks for new addresses.
+if [[ -n ${OSHIRASE_LISTEN:-} || ! -f $env_file ]]; then
+  listen="${OSHIRASE_LISTEN:-}"
+  if [[ -z $listen ]]; then
+    listen="127.0.0.1:$port"
+    while read -r address; do
+      listen+=",$address:$port"
+    done < <(ip -4 -o addr show 2>/dev/null | awk '$2 ~ /^virbr/ { split($4, a, "/"); print a[1] }')
+  fi
+  {
+    echo "# oshirase serve's settings (install-linux.sh). Addresses separated by"
+    echo "# commas; a VM bridge's accepts connections from that bridge's network only."
+    echo "OSHIRASE_LISTEN=$listen"
+    echo "# The backend: auto (the desktop's notifications), email or log."
+    echo "#OSHIRASE_BACKEND=email"
+  } > "$env_file"
+else
+  say "Keeping $env_file"
+fi
+listen="$(sed -n 's/^OSHIRASE_LISTEN=//p' "$env_file" | tail -1)"
+probe="${listen%%,*}"
+probe="${probe:-127.0.0.1:$port}"
+
+say "Installing $binary ($version), listening on ${listen:-the default address}"
 install -m 0755 "$source_binary" "$binary"
 install -m 0644 "$repo/systemd/oshirase.service" "$unit_dir/oshirase.service"
-printf 'OSHIRASE_LISTEN=%s\n' "$listen" > "$env_file"
 
 systemctl --user daemon-reload
 systemctl --user enable oshirase.service >/dev/null 2>&1
@@ -58,7 +81,7 @@ systemctl --user restart oshirase.service
 
 say "Waiting for the daemon"
 for _ in $(seq 20); do
-  if health="$(curl -fsS "http://127.0.0.1:$port/v1/health" 2>/dev/null)"; then
+  if health="$(curl -fsS "http://$probe/v1/health" 2>/dev/null)"; then
     say "Running: $health"
     say "Log: journalctl --user -u oshirase"
     exit 0

@@ -61,11 +61,30 @@ where the server renders markup, since the specification has no subtitle.
 With no notification service running, the daemon answers 502 with the
 reason.
 
-The installer has the daemon listen on loopback and on every libvirt bridge
-(`virbr*`) address, written to `~/.config/oshirase/env` as
-`OSHIRASE_LISTEN`; set `OSHIRASE_LISTEN` when running the installer to choose
-the addresses yourself. A host firewall usually drops a guest's connections
-to the host, so allow the port on the bridge, e.g. with ufw:
+The service reads its settings from `~/.config/oshirase/env` (systemd's
+`%E`, so `$XDG_CONFIG_HOME` if the user manager has one), which the
+installer writes the first time and keeps afterwards:
+
+- `OSHIRASE_LISTEN`: loopback and every libvirt bridge (`virbr*`) address at
+  install time. Set `OSHIRASE_LISTEN` when running the installer to choose
+  the addresses yourself (that rewrites the file).
+- `OSHIRASE_BACKEND`: `email` to send mail instead of desktop notifications
+  (see below), `log`, or unset for the desktop. `oshirase auth` must then
+  write the grant where the service looks: the same config directory, or
+  set `OSHIRASE_EMAIL_CONFIG` in this file to the path it used.
+
+Anything that can connect to the daemon can show notifications and withdraw
+them, and with the email backend send mail as you, so mind where it
+listens. A listener on a specific non-loopback address, such as a bridge's,
+accepts connections only from that address's own network (the guests on
+that bridge) and loopback. Without that, Linux would also take a connection
+for the bridge's address arriving from the LAN, from any machine that routes
+the bridge's subnet through this host. Every guest on the bridge can still
+reach it, not only the VM it is meant for. A wildcard address (`0.0.0.0`)
+is not filtered. Bridge addresses are bound even before the bridge is up.
+
+A host firewall usually drops a guest's connections to the host, so allow
+the port on the bridge, e.g. with ufw:
 
 ```sh
 sudo ufw allow in on virbr0 to 192.168.122.1 port 4649 proto tcp comment 'oshirase from libvirt guests'

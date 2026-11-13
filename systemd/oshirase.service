@@ -7,11 +7,11 @@ Documentation=https://github.com/moroz/oshirase
 After=graphical-session.target
 
 [Service]
-# OSHIRASE_LISTEN: loopback plus the VM bridge addresses found at install.
-EnvironmentFile=-%h/.config/oshirase/env
+# Written by install-linux.sh: OSHIRASE_LISTEN (loopback plus the VM bridge
+# addresses found at install) and, to choose a backend other than the
+# desktop's, OSHIRASE_BACKEND. %E is $XDG_CONFIG_HOME, else ~/.config.
+EnvironmentFile=-%E/oshirase/env
 ExecStart=%h/.local/bin/oshirase serve
-# A bridge address that is not up yet (libvirt's network starting late) fails
-# the bind; retry until it is.
 Restart=always
 RestartSec=5
 

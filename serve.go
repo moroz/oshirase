@@ -24,7 +24,8 @@ func runServe(args []string) error {
 	flags := flag.NewFlagSet("serve", flag.ContinueOnError)
 	listen := flags.String("listen", envOr("OSHIRASE_LISTEN", defaultListen),
 		"address to listen on; several separated by commas, e.g. a VM bridge's besides loopback")
-	backendName := flags.String("backend", "auto", "auto, log, email, or a platform backend (macos, freedesktop)")
+	backendName := flags.String("backend", envOr("OSHIRASE_BACKEND", "auto"),
+		"auto, log, email, or a platform backend (macos, freedesktop)")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
