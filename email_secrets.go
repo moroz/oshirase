@@ -19,10 +19,10 @@ import (
 
 // Where the email backend's secrets live. With "secrets": "keyring" in
 // email.json, the refresh token, API token and client secret are in the
-// OS keyring (the Secret Service on Linux, the login Keychain on macOS), in
-// one item per grant, and email.json holds only the grant's id. With
-// "file", or no "secrets" at all (configurations from before the keyring),
-// they are in email.json itself.
+// OS keyring (the Secret Service on Linux, the default Keychain, normally
+// the login one, on macOS), in one item per grant, and email.json holds
+// only the grant's id. With "file", or no "secrets" at all (configurations
+// from before the keyring), they are in email.json itself.
 const (
 	secretsInKeyring = "keyring"
 	secretsInFile    = "file"
@@ -252,7 +252,7 @@ func (k *keyringClient) remove(ctx context.Context, grantID string) error {
 // keyringName is what the person knows the keyring as.
 func keyringName() string {
 	if runtime.GOOS == "darwin" {
-		return "the login Keychain"
+		return "the default Keychain"
 	}
 	return "the Secret Service keyring"
 }

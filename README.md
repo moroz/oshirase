@@ -154,8 +154,9 @@ secrets go into the OS keyring (below) and everything else into
 | anywhere | `$OSHIRASE_EMAIL_CONFIG`, or `-config` on `oshirase auth` |
 
 `email.json` is JSON (`provider`, `to`, `from`, `client_id`,
-`token_endpoint`, `jmap_session`, `secrets`, `grant_id`), written with mode
-0600 in a 0700 directory. The daemon reloads it when it changes, so
+`token_endpoint`, `jmap_session`, `max_per_minute`, `secrets`, `grant_id`,
+and, in file mode only, `refresh_token`, `api_token` and `client_secret`),
+written with mode 0600 in a 0700 directory. The daemon reloads it when it changes, so
 re-running `oshirase auth` repairs a revoked grant without a restart. The
 daemon refuses to start with `-backend email` and no file. Neither it nor
 `oshirase auth` logs a token or a message body.
@@ -169,8 +170,8 @@ and the account `email-grant-<grant id>`; `email.json` says
 
 | | |
 |---|---|
-| Linux | the Secret Service (e.g. GNOME Keyring), in the login collection, reached over D-Bus |
-| macOS | the login Keychain, through `/usr/bin/security` |
+| Linux | the Secret Service (e.g. GNOME Keyring, KeePassXC) over D-Bus: its `login` collection, else the one its `default` alias names |
+| macOS | the default Keychain (normally the login Keychain), through `/usr/bin/security` |
 
 What that buys over a 0600 file: the secrets are encrypted at rest, under
 your login password, so a copied disk, a backup or a stray `cat` of the
