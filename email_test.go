@@ -1,0 +1,586 @@
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"encoding/json"
+	"io"
+	"log"
+	"mime"
+	"net/http"
+	"net/http/httptest"
+	"net/mail"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+)
+
+const (
+	secretRefresh = "refresh-SECRET-1"
+	secretAccess  = "access-SECRET-1"
+	secretBody    = "body that must not be logged"
+)
+
+// fakeTokenEndpoint answers the refresh grant. It rotates the refresh
+// token when rotate is set, and refuses with failure when that is set.
+type fakeTokenEndpoint struct {
+	mu       sync.Mutex
+	t        *testing.T
+	secret   string // expected client_secret; "" for a public client
+	current  string // the refresh token it accepts
+	rotate   bool
+	failure  string // a JSON error body to answer with, status 400
+	requests int
+	access   []string // access tokens it has issued
+}
+
+func (f *fakeTokenEndpoint) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.requests++
+	if err := r.ParseForm(); err != nil {
+		f.t.Errorf("token request: %v", err)
+	}
+	if got := r.PostForm.Get("client_secret"); got != f.secret {
+		f.t.Errorf("client_secret = %q, want %q", got, f.secret)
+	}
+	if f.failure != "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, f.failure)
+		return
+	}
+	if r.PostForm.Get("grant_type") != "refresh_token" || r.PostForm.Get("refresh_token") != f.current {
+		w.WriteHeader(http.StatusBadRequest)
+		io.WriteString(w, `{"error":"invalid_grant"}`)
+		return
+	}
+	access := secretAccess + "-" + string(rune('a'+len(f.access)))
+	f.access = append(f.access, access)
+	response := map[string]any{"access_token": access, "token_type": "Bearer", "expires_in": 3600}
+	if f.rotate {
+		f.current = f.current + "-next"
+		response["refresh_token"] = f.current
+	}
+	json.NewEncoder(w).Encode(response)
+}
+
+func writeConfig(t *testing.T, config emailConfig) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "oshirase", "email.json")
+	if err := saveEmailConfig(path, &config); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func newTestBackend(t *testing.T, config emailConfig) *emailBackend {
+	t.Helper()
+	backend, err := newEmailBackend(writeConfig(t, config))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return backend
+}
+
+// captureLog collects what the daemon logs for the length of the test.
+func captureLog(t *testing.T) *bytes.Buffer {
+	var buffer bytes.Buffer
+	log.SetOutput(&buffer)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return &buffer
+}
+
+func assertNoSecrets(t *testing.T, where, text string) {
+	t.Helper()
+	for _, secret := range []string{"SECRET", secretBody} {
+		if strings.Contains(text, secret) {
+			t.Errorf("%s contains %q: %s", where, secret, text)
+		}
+	}
+}
+
+// --- Gmail
+
+type fakeGmail struct {
+	mu       sync.Mutex
+	t        *testing.T
+	tokens   *fakeTokenEndpoint
+	reject   int // answer this many requests with 401 first
+	status   int // when not 0, fail with this status and a Google error
+	messages []*mail.Message
+	auth     []string
+}
+
+func (f *fakeGmail) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.auth = append(f.auth, r.Header.Get("Authorization"))
+	if f.reject > 0 {
+		f.reject--
+		w.WriteHeader(http.StatusUnauthorized)
+		io.WriteString(w, `{"error":{"code":401,"status":"UNAUTHENTICATED","message":"Invalid Credentials"}}`)
+		return
+	}
+	if f.status != 0 {
+		w.WriteHeader(f.status)
+		io.WriteString(w, `{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Request had insufficient authentication scopes."}}`)
+		return
+	}
+	var request struct {
+		Raw string `json:"raw"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+		f.t.Fatalf("gmail request: %v", err)
+	}
+	raw, err := base64.URLEncoding.DecodeString(request.Raw)
+	if err != nil {
+		f.t.Fatalf("raw is not base64url: %v", err)
+	}
+	message, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		f.t.Fatalf("raw is not a message: %v", err)
+	}
+	f.messages = append(f.messages, message)
+	io.WriteString(w, `{"id":"1","threadId":"1","labelIds":["SENT"]}`)
+}
+
+func googleSetup(t *testing.T) (*emailBackend, *fakeTokenEndpoint, *fakeGmail) {
+	tokens := &fakeTokenEndpoint{t: t, secret: "client-SECRET", current: secretRefresh}
+	tokenServer := httptest.NewServer(tokens)
+	t.Cleanup(tokenServer.Close)
+	gmail := &fakeGmail{t: t, tokens: tokens}
+	gmailServer := httptest.NewServer(gmail)
+	t.Cleanup(gmailServer.Close)
+
+	backend := newTestBackend(t, emailConfig{
+		Provider:      providerGoogle,
+		To:            "me@example.com",
+		TokenEndpoint: tokenServer.URL,
+		ClientID:      "client-id",
+		ClientSecret:  "client-SECRET",
+		RefreshToken:  secretRefresh,
+	})
+	backend.gmailSendURL = gmailServer.URL
+	return backend, tokens, gmail
+}
+
+func TestGmailSendsTheNotification(t *testing.T) {
+	backend, tokens, gmail := googleSetup(t)
+	n := Notification{Title: "Touch your security key", Body: "git push origin\nto main", Urgency: UrgencyCritical, Source: "ssh"}
+	if err := backend.Notify(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(gmail.messages) != 1 {
+		t.Fatalf("gmail got %d messages", len(gmail.messages))
+	}
+	message := gmail.messages[0]
+	subject, err := new(mime.WordDecoder).DecodeHeader(message.Header.Get("Subject"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "[oshirase · ssh] Touch your security key"; subject != want {
+		t.Errorf("subject = %q, want %q", subject, want)
+	}
+	if got := message.Header.Get("To"); got != "<me@example.com>" {
+		t.Errorf("To = %q", got)
+	}
+	if message.Header.Get("From") != "" {
+		t.Errorf("From = %q; Gmail should fill it in", message.Header.Get("From"))
+	}
+	if message.Header.Get("Importance") != "high" || !strings.HasPrefix(message.Header.Get("X-Priority"), "1") {
+		t.Errorf("critical is not marked important: %v", message.Header)
+	}
+	body, _ := io.ReadAll(message.Body)
+	if !strings.Contains(string(body), "git push origin\r\nto main") {
+		t.Errorf("body = %q", body)
+	}
+	if gmail.auth[0] != "Bearer "+tokens.access[0] {
+		t.Errorf("Authorization = %q", gmail.auth[0])
+	}
+}
+
+func TestGmailReusesTheAccessToken(t *testing.T) {
+	backend, tokens, gmail := googleSetup(t)
+	for range 3 {
+		if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if tokens.requests != 1 {
+		t.Errorf("refreshed %d times for 3 notifications, want 1", tokens.requests)
+	}
+	if len(gmail.messages) != 3 {
+		t.Errorf("sent %d", len(gmail.messages))
+	}
+	if gmail.messages[0].Header.Get("X-Priority") != "" {
+		t.Error("normal urgency should add no priority header")
+	}
+
+	// Past expiry, it refreshes again.
+	backend.now = func() time.Time { return time.Now().Add(2 * time.Hour) }
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	if tokens.requests != 2 {
+		t.Errorf("refreshed %d times after expiry, want 2", tokens.requests)
+	}
+}
+
+func TestGmailRetriesOnceAfter401(t *testing.T) {
+	backend, tokens, gmail := googleSetup(t)
+	gmail.reject = 1
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	if tokens.requests != 2 || len(gmail.messages) != 1 {
+		t.Errorf("refreshes = %d, messages = %d; want 2 and 1", tokens.requests, len(gmail.messages))
+	}
+
+	gmail.reject = 2
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "run oshirase auth google") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestGmailRefusalReachesTheCaller(t *testing.T) {
+	backend, _, gmail := googleSetup(t)
+	gmail.status = http.StatusForbidden
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "PERMISSION_DENIED") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// A revoked grant is a 502 that says what to run, and nothing secret
+// reaches the log or the response.
+func TestRevokedRefreshTokenIs502WithAdvice(t *testing.T) {
+	logged := captureLog(t)
+	backend, tokens, _ := googleSetup(t)
+	tokens.failure = `{"error":"invalid_grant","error_description":"Token has been expired or revoked."}`
+
+	handler := notifyHandler(backend)
+	request := httptest.NewRequest(http.MethodPost, "/v1/notify",
+		strings.NewReader(`{"title":"Touch key","body":"`+secretBody+`","source":"ssh"}`))
+	request.Header.Set("Content-Type", "application/json")
+	recorder := httptest.NewRecorder()
+	handler(recorder, request)
+
+	if recorder.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d", recorder.Code)
+	}
+	var response ErrorResponse
+	json.Unmarshal(recorder.Body.Bytes(), &response)
+	if !strings.Contains(response.Error, "refresh token revoked or expired") ||
+		!strings.Contains(response.Error, "run oshirase auth google") {
+		t.Errorf("error = %q", response.Error)
+	}
+	assertNoSecrets(t, "response", recorder.Body.String())
+	assertNoSecrets(t, "log", logged.String())
+}
+
+func TestSubjectCannotInjectHeaders(t *testing.T) {
+	message := composeEmail(Notification{Title: "a\r\nBcc: evil@example.com", Source: "x\ny"})
+	raw := buildRFC5322("", "me@example.com", message, time.Now())
+	parsed, err := mail.ReadMessage(bytes.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parsed.Header.Get("Bcc") != "" {
+		t.Errorf("title injected a header: %q", raw)
+	}
+	if message.Subject != "[oshirase · x y] a Bcc: evil@example.com" {
+		t.Errorf("subject = %q", message.Subject)
+	}
+	// With no body, the title is the body.
+	if message.Body != "a\r\nBcc: evil@example.com" {
+		t.Errorf("body = %q", message.Body)
+	}
+}
+
+// --- Fastmail / JMAP
+
+type fakeJMAP struct {
+	mu          sync.Mutex
+	t           *testing.T
+	server      *httptest.Server
+	token       func() string // the bearer it accepts
+	submission  bool
+	notCreated  bool
+	sent        []map[string]any // Email/set create objects
+	submissions []map[string]any
+	sessions    int
+}
+
+func newFakeJMAP(t *testing.T, token func() string) *fakeJMAP {
+	f := &fakeJMAP{t: t, token: token, submission: true}
+	f.server = httptest.NewServer(f)
+	t.Cleanup(f.server.Close)
+	return f
+}
+
+func (f *fakeJMAP) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if r.Header.Get("Authorization") != "Bearer "+f.token() {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	switch r.URL.Path {
+	case "/session":
+		f.sessions++
+		capabilities := map[string]any{jmapCore: map[string]any{}, jmapMail: map[string]any{}}
+		primary := map[string]string{jmapMail: "acc1"}
+		if f.submission {
+			capabilities[jmapSubmission] = map[string]any{}
+			primary[jmapSubmission] = "acc1"
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"apiUrl":          f.server.URL + "/api",
+			"capabilities":    capabilities,
+			"primaryAccounts": primary,
+		})
+	case "/api":
+		var request struct {
+			Using       []string            `json:"using"`
+			MethodCalls [][]json.RawMessage `json:"methodCalls"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			f.t.Fatalf("api request: %v", err)
+		}
+		var responses []any
+		for _, call := range request.MethodCalls {
+			var name, id string
+			var args map[string]any
+			json.Unmarshal(call[0], &name)
+			json.Unmarshal(call[1], &args)
+			json.Unmarshal(call[2], &id)
+			if args["accountId"] != "acc1" {
+				f.t.Errorf("%s accountId = %v", name, args["accountId"])
+			}
+			var result any
+			switch name {
+			case "Identity/get":
+				result = map[string]any{"list": []any{
+					map[string]string{"id": "id-other", "email": "other@example.com"},
+					map[string]string{"id": "id-me", "email": "me@fastmail.com"},
+				}}
+			case "Mailbox/query":
+				role := args["filter"].(map[string]any)["role"]
+				result = map[string]any{"ids": []string{"mb-" + role.(string)}}
+			case "Email/set":
+				create := args["create"].(map[string]any)["draft"].(map[string]any)
+				f.sent = append(f.sent, create)
+				if f.notCreated {
+					result = map[string]any{"notCreated": map[string]any{"draft": map[string]string{"type": "overQuota", "description": "mailbox full"}}}
+				} else {
+					result = map[string]any{"created": map[string]any{"draft": map[string]string{"id": "e1"}}}
+				}
+			case "EmailSubmission/set":
+				f.submissions = append(f.submissions, args)
+				result = map[string]any{"created": map[string]any{"send": map[string]string{"id": "s1"}}}
+			default:
+				f.t.Errorf("unexpected method %s", name)
+			}
+			responses = append(responses, []any{name, result, id})
+		}
+		json.NewEncoder(w).Encode(map[string]any{"methodResponses": responses, "sessionState": "1"})
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func fastmailSetup(t *testing.T) (*emailBackend, *fakeTokenEndpoint, *fakeJMAP) {
+	tokens := &fakeTokenEndpoint{t: t, current: secretRefresh, rotate: true}
+	tokenServer := httptest.NewServer(tokens)
+	t.Cleanup(tokenServer.Close)
+	jmap := newFakeJMAP(t, func() string {
+		tokens.mu.Lock()
+		defer tokens.mu.Unlock()
+		if len(tokens.access) == 0 {
+			return "none yet"
+		}
+		return tokens.access[len(tokens.access)-1]
+	})
+	backend := newTestBackend(t, emailConfig{
+		Provider:      providerFastmail,
+		To:            "phone@example.com",
+		From:          "me@fastmail.com",
+		TokenEndpoint: tokenServer.URL,
+		ClientID:      "dyn-client",
+		RefreshToken:  secretRefresh,
+		JMAPSession:   jmap.server.URL + "/session",
+	})
+	return backend, tokens, jmap
+}
+
+func TestJMAPSendsAndPersistsTheRotatedRefreshToken(t *testing.T) {
+	logged := captureLog(t)
+	backend, tokens, jmap := fastmailSetup(t)
+	n := Notification{Title: "Tests failed", Body: secretBody, Urgency: UrgencyLow, Source: "oshirase · email-backend"}
+	if err := backend.Notify(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(jmap.sent) != 1 || len(jmap.submissions) != 1 {
+		t.Fatalf("sent %d, submitted %d", len(jmap.sent), len(jmap.submissions))
+	}
+	email := jmap.sent[0]
+	if email["subject"] != "[oshirase · oshirase · email-backend] Tests failed" {
+		t.Errorf("subject = %v", email["subject"])
+	}
+	if from := email["from"].([]any)[0].(map[string]any)["email"]; from != "me@fastmail.com" {
+		t.Errorf("from = %v", from)
+	}
+	if to := email["to"].([]any)[0].(map[string]any)["email"]; to != "phone@example.com" {
+		t.Errorf("to = %v", to)
+	}
+	if email["header:Importance:asText"] != "low" {
+		t.Errorf("low urgency not marked: %v", email)
+	}
+	if _, ok := email["mailboxIds"].(map[string]any)["mb-drafts"]; !ok {
+		t.Errorf("not created in Drafts: %v", email["mailboxIds"])
+	}
+	submission := jmap.submissions[0]
+	created := submission["create"].(map[string]any)["send"].(map[string]any)
+	if created["identityId"] != "id-me" || created["emailId"] != "#draft" {
+		t.Errorf("submission = %v", created)
+	}
+	update := submission["onSuccessUpdateEmail"].(map[string]any)["#send"].(map[string]any)
+	if update["mailboxIds/mb-sent"] != true {
+		t.Errorf("not moved to Sent: %v", update)
+	}
+
+	// The rotated refresh token is on disk, still private.
+	saved, _, err := loadEmailConfig(backend.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.RefreshToken != tokens.current {
+		t.Errorf("saved refresh token %q, endpoint now expects %q", saved.RefreshToken, tokens.current)
+	}
+	info, _ := os.Stat(backend.path)
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("mode = %o", info.Mode().Perm())
+	}
+
+	// The second notification uses the cached session and access token.
+	if err := backend.Notify(context.Background(), n); err != nil {
+		t.Fatal(err)
+	}
+	if jmap.sessions != 1 || tokens.requests != 1 {
+		t.Errorf("sessions = %d, refreshes = %d; want 1 and 1", jmap.sessions, tokens.requests)
+	}
+	assertNoSecrets(t, "log", logged.String())
+}
+
+func TestJMAPNotCreatedIsAnError(t *testing.T) {
+	backend, _, jmap := fastmailSetup(t)
+	jmap.notCreated = true
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "overQuota") {
+		t.Errorf("err = %v", err)
+	}
+	if backend.jmap != nil {
+		t.Error("a failure should drop the cached session")
+	}
+}
+
+func TestJMAPWithoutSubmissionSaysSo(t *testing.T) {
+	backend, _, jmap := fastmailSetup(t)
+	jmap.submission = false
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "does not allow sending") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestFastmailTemporaryRefusal(t *testing.T) {
+	backend, tokens, _ := fastmailSetup(t)
+	tokens.failure = `{"error":"invalid_grant","temporary":true}`
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "try again later") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestFastmailAPIToken(t *testing.T) {
+	jmap := newFakeJMAP(t, func() string { return "api-SECRET" })
+	backend := newTestBackend(t, emailConfig{
+		Provider:    providerFastmail,
+		To:          "phone@example.com",
+		From:        "other@example.com",
+		APIToken:    "api-SECRET",
+		JMAPSession: jmap.server.URL + "/session",
+	})
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	created := jmap.submissions[0]["create"].(map[string]any)["send"].(map[string]any)
+	if created["identityId"] != "id-other" {
+		t.Errorf("identity = %v, want the one for From", created["identityId"])
+	}
+
+	backend.config.APIToken = "revoked"
+	backend.jmap = nil
+	err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal})
+	if err == nil || !strings.Contains(err.Error(), "-api-token") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+// --- Configuration
+
+func TestConfigReloadsAfterAuth(t *testing.T) {
+	backend, tokens, gmail := googleSetup(t)
+	tokens.failure = `{"error":"invalid_grant"}`
+	if backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}) == nil {
+		t.Fatal("want a failure with the revoked grant")
+	}
+
+	// `oshirase auth google` writes a new grant; the daemon picks it up.
+	tokens.failure = ""
+	tokens.current = "refresh-SECRET-2"
+	config := *backend.config
+	config.RefreshToken = "refresh-SECRET-2"
+	time.Sleep(10 * time.Millisecond) // a distinct mtime
+	if err := saveEmailConfig(backend.path, &config); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Notify(context.Background(), Notification{Title: "x", Urgency: UrgencyNormal}); err != nil {
+		t.Fatal(err)
+	}
+	if len(gmail.messages) != 1 {
+		t.Errorf("sent %d", len(gmail.messages))
+	}
+}
+
+func TestMissingConfigSaysWhatToRun(t *testing.T) {
+	t.Setenv("OSHIRASE_EMAIL_CONFIG", filepath.Join(t.TempDir(), "none.json"))
+	_, err := selectBackend("email")
+	if err == nil || !strings.Contains(err.Error(), "run oshirase auth") {
+		t.Errorf("err = %v", err)
+	}
+}
+
+func TestConfigValidation(t *testing.T) {
+	cases := map[string]emailConfig{
+		"no provider":         {To: "a@example.com"},
+		"bad to":              {Provider: providerGoogle, To: "nope", ClientID: "c", ClientSecret: "s", RefreshToken: "r", TokenEndpoint: "t"},
+		"google no secret":    {Provider: providerGoogle, To: "a@example.com", ClientID: "c", RefreshToken: "r", TokenEndpoint: "t"},
+		"fastmail no from":    {Provider: providerFastmail, To: "a@example.com", APIToken: "x", JMAPSession: "s"},
+		"fastmail no grant":   {Provider: providerFastmail, To: "a@example.com", From: "b@example.com", JMAPSession: "s"},
+		"fastmail no session": {Provider: providerFastmail, To: "a@example.com", From: "b@example.com", APIToken: "x"},
+	}
+	for name, config := range cases {
+		if config.validate() == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+}

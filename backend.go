@@ -29,6 +29,8 @@ func selectBackend(name string) (Backend, error) {
 		return nativeBackend()
 	case "log":
 		return logBackend{}, nil
+	case "email":
+		return openEmailBackend()
 	default:
 		backend, err := namedNativeBackend(name)
 		if err != nil {
