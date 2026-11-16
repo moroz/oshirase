@@ -118,12 +118,16 @@ often than the binary.
 
 The daemon listens on `127.0.0.1:4649` by default, so nothing else on the
 network can reach it. A Lima guest reaches the host's loopback as
-`host.lima.internal`, which is `oshirase send`'s default. A libvirt guest
-cannot reach the host's loopback; the daemon listens on the bridge as well
-(`-listen` takes several addresses separated by commas, and
-`install-linux.sh` sets that up), and the guest sets
-`OSHIRASE_URL=http://192.168.122.1:4649`, its gateway. Elsewhere, set
-`OSHIRASE_URL` (or `-url`).
+`host.lima.internal`. A libvirt guest cannot reach the host's loopback; the
+daemon listens on the bridge as well (`-listen` takes several addresses
+separated by commas, and `install-linux.sh` sets that up, adding a bridge
+that appeared since on a rerun), and the guest reaches it at its default
+gateway.
+
+`oshirase send` and `withdraw` find the daemon on their own: `-url`, else
+`OSHIRASE_URL`, else the first of a daemon on this machine's loopback (the
+host itself), `host.lima.internal` (a Lima guest) and the default gateway
+(a libvirt guest). Set `OSHIRASE_URL` anywhere else.
 
 `oshirase send` exits non-zero when the daemon did not answer or refused, so a
 caller can fall back to something else.

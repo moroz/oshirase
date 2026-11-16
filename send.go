@@ -2,23 +2,81 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"os"
 	"strings"
 	"time"
 )
 
-// From a Lima guest, host.lima.internal is the host's own loopback, which is
-// where the daemon listens by default.
-const defaultURL = "http://host.lima.internal:4649"
+// urlHelp describes -url for both commands that take it.
+const urlHelp = "daemon address (default: $OSHIRASE_URL, else the first daemon found: this machine's loopback, host.lima.internal, the default gateway)"
+
+// daemonURL is -url when given, then OSHIRASE_URL, then discoverURL's guess.
+func daemonURL(flagValue string) string {
+	if flagValue != "" {
+		return flagValue
+	}
+	if value := os.Getenv("OSHIRASE_URL"); value != "" {
+		return value
+	}
+	return discoverURL(dialable, resolvable, defaultGateway)
+}
+
+// discoverURL finds the daemon without being told where it is, so the one
+// command works on the host and in either kind of guest:
+//
+//   - on the host itself, the daemon answers on loopback;
+//   - from a Lima guest, host.lima.internal is the host's loopback;
+//   - from a libvirt guest, the default gateway is the host's bridge
+//     address, which install-linux.sh has the daemon listen on.
+//
+// Loopback comes first because it is a local connect, answered or refused at
+// once; the name lookup can wait on a resolver. When nothing is found, the
+// Lima name is returned as before, so the error names what was tried last.
+func discoverURL(dial func(string) bool, resolve func(string) bool, gateway func() string) string {
+	if dial(net.JoinHostPort("127.0.0.1", defaultPort)) {
+		return "http://127.0.0.1:" + defaultPort
+	}
+	if resolve(limaHost) {
+		return "http://" + limaHost + ":" + defaultPort
+	}
+	if address := gateway(); address != "" {
+		return "http://" + net.JoinHostPort(address, defaultPort)
+	}
+	return "http://" + limaHost + ":" + defaultPort
+}
+
+const (
+	defaultPort = "4649"
+	limaHost    = "host.lima.internal"
+)
+
+func dialable(address string) bool {
+	conn, err := net.DialTimeout("tcp", address, 300*time.Millisecond)
+	if err != nil {
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+func resolvable(host string) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	addresses, err := net.DefaultResolver.LookupHost(ctx, host)
+	return err == nil && len(addresses) > 0
+}
 
 func runSend(args []string) error {
 	flags := flag.NewFlagSet("send", flag.ContinueOnError)
-	baseURL := flags.String("url", envOr("OSHIRASE_URL", defaultURL), "daemon address")
+	baseURL := flags.String("url", "", urlHelp)
 	urgency := flags.String("urgency", "normal", "low, normal or critical")
 	source := flags.String("source", "", "what is sending this, e.g. ssh")
 	tag := flags.String("tag", "", "a tag for `oshirase withdraw` to take it down by, e.g. ssh-touch")
@@ -57,7 +115,7 @@ func runSend(args []string) error {
 		// the default; giving up early would not stop the email going out.
 		*timeout = emailSendTimeout
 	}
-	body, err := post(*baseURL, "/v1/notify", notification, *timeout)
+	body, err := post(daemonURL(*baseURL), "/v1/notify", notification, *timeout)
 	if err != nil {
 		return err
 	}
@@ -89,7 +147,7 @@ func checkDeliveredVia(via string, body []byte) error {
 
 func runWithdraw(args []string) error {
 	flags := flag.NewFlagSet("withdraw", flag.ContinueOnError)
-	baseURL := flags.String("url", envOr("OSHIRASE_URL", defaultURL), "daemon address")
+	baseURL := flags.String("url", "", urlHelp)
 	tag := flags.String("tag", "", "take down the notifications sent with this tag (required)")
 	timeout := flags.Duration("timeout", 5*time.Second, "give up after this long")
 	flags.Usage = func() {
@@ -106,7 +164,7 @@ func runWithdraw(args []string) error {
 	if err := NormalizeTag(*tag); err != nil {
 		return err
 	}
-	_, err := post(*baseURL, "/v1/withdraw", WithdrawRequest{Tag: *tag}, *timeout)
+	_, err := post(daemonURL(*baseURL), "/v1/withdraw", WithdrawRequest{Tag: *tag}, *timeout)
 	return err
 }
 

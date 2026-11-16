@@ -66,6 +66,23 @@ if [[ -n ${OSHIRASE_LISTEN:-} || ! -f $env_file ]]; then
   } > "$env_file"
 else
   say "Keeping $env_file"
+  # A bridge that came up after the first install (libvirt installed later,
+  # or a new network) is added, and nothing else in the file is touched.
+  # The daemon binds with freebind, so listing an address costs nothing
+  # while its bridge is down.
+  current="$(sed -n 's/^OSHIRASE_LISTEN=//p' "$env_file" | tail -1)"
+  if [[ -n $current ]]; then
+    added=""
+    while read -r address; do
+      [[ ",$current," == *",$address:$port,"* ]] && continue
+      current+=",$address:$port"
+      added+=" $address:$port"
+    done < <(ip -4 -o addr show 2>/dev/null | awk '$2 ~ /^virbr/ { split($4, a, "/"); print a[1] }')
+    if [[ -n $added ]]; then
+      say "Adding the VM bridge address(es)$added to $env_file"
+      sed -i "s|^OSHIRASE_LISTEN=.*|OSHIRASE_LISTEN=$current|" "$env_file"
+    fi
+  fi
 fi
 listen="$(sed -n 's/^OSHIRASE_LISTEN=//p' "$env_file" | tail -1)"
 probe="${listen%%,*}"
